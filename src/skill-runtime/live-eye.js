@@ -28,6 +28,12 @@ const DOF_SET_NAMES = [
   'SCREEN_BG_RENDER', 'SCREEN_BG_COLOR', 'SCREEN_BG_TEXTURE',
 ];
 
+// Jibo's canonical "I'm listening" color: the exact RGB the embodied-dialog
+// listen design uses for the wake-word reaction (jibo-embodied-dialog Assets
+// `Led.LISTENING`). Used to tint the eye while the mic is open; the host
+// drives the LED ring with the same value. [0,1]-normalized.
+export const LISTENING_RGB = [0.05, 0.73, 0.94];
+
 // Linear-interpolate a .anim channel set (content.channels[] of {dofName,times,values}) at time t.
 function sampleAnim(animJson, t) {
   const out = {};
@@ -1258,6 +1264,12 @@ export function initOfflineServices(jibo, requireFn) {
             const fin = window.__pendingSounds.get(m.id);
             window.__pendingSounds.delete(m.id);
             try { fin(); } catch (_) { /* */ }
+          } else if (m.kind === 'listening') {
+            // Host opened/closed a voice turn (the sim's stand-in for the
+            // wake word). Tint the eye Jibo's listening blue while open; the
+            // host drives the LED ring with the same color. null clears the
+            // override so the eye returns to its natural texture color.
+            window.__listeningEye = m.on ? LISTENING_RGB : null;
           } else if (m.kind === 'eye-lookat-dofs') {
             // Host's createLookAtController emits residual eye DOFs every
             // frame the body lookat is engaged. driveEye's tick reads
@@ -1642,6 +1654,17 @@ export function driveEye(jibo, prep) {
               k === 'led_r' || k === 'led_g' || k === 'led_b') continue;
           frame[k] = active[k];
         }
+      }
+      // Listening cue: while a voice turn is open, tint the eye Jibo's
+      // canonical listening blue — the real FaceRenderer multiplies the eye
+      // texture by these eye_*ChannelBn_r color DOFs (default white = natural
+      // texture). Applied last so it wins over the idle pose and any active
+      // animation, the way the wake-word reaction overrides the idle look.
+      const lis = window.__listeningEye;
+      if (lis) {
+        frame.eye_redChannelBn_r = lis[0];
+        frame.eye_greenChannelBn_r = lis[1];
+        frame.eye_blueChannelBn_r = lis[2];
       }
       // Populate sourceTimes for any animation EyeContainer is tracking.
       // EyeContainer.display consults meta.sourceTimes to (1) detect a

@@ -26,6 +26,7 @@ import { createLpsService } from './bridge/services/lps-service.js';
 import { createNotificationsService } from './bridge/services/notifications-service.js';
 import { createMediaService } from './bridge/services/media-service.js';
 import { loadSkillManifest } from './skill-runtime/skill-loader.js';
+import { createWakeWord } from './skill-runtime/wake-word.js';
 
 // Skill bundles are discovered at boot by listing the /skills tree and
 // keeping every immediate subdirectory that has a package.json — the picker
@@ -366,6 +367,38 @@ async function startSkillRuntime() {
     asr.recognize(text);
     try { iframe.contentWindow.postMessage({ __jibo: true, kind: 'utterance', text }, '*'); } catch (_) { /* iframe gone */ }
   });
+  // Listening cue: while the mic is open, Jibo lights his ring and eye his
+  // canonical "I'm listening" blue — the exact [0.05,0.73,0.94] the
+  // embodied-dialog listen design uses for the wake-word reaction. The ring is
+  // driven here on the host rig; the eye is tinted inside the iframe (its real
+  // FaceRenderer owns the eye color DOFs) via a 'listening' message. The
+  // pre-listening ring color is saved and restored when the turn settles so a
+  // turn that yields no response animation returns the ring to how it looked.
+  // (Real wake-word detection will later drive this same cue; for now the mic
+  // button stands in for "Hey Jibo".)
+  const LISTENING_RGB = [0.05, 0.73, 0.94];
+  let listeningActive = false;
+  let ledBeforeListening = null;
+  function startListeningCue() {
+    if (listeningActive) return;
+    listeningActive = true;
+    try {
+      const ring = viewport.rig.parts && viewport.rig.parts.lightring;
+      ledBeforeListening = ring ? ring.material.color.getHex() : null;
+      if (viewport.rig.setLEDColor) viewport.rig.setLEDColor(...LISTENING_RGB);
+    } catch (_) { /* rig not ready */ }
+    try { iframe.contentWindow.postMessage({ __jibo: true, kind: 'listening', on: true }, '*'); } catch (_) { /* iframe gone */ }
+  }
+  function stopListeningCue() {
+    if (!listeningActive) return;
+    listeningActive = false;
+    try {
+      if (ledBeforeListening != null && viewport.rig.setLEDHex) viewport.rig.setLEDHex(ledBeforeListening);
+    } catch (_) { /* rig not ready */ }
+    ledBeforeListening = null;
+    try { iframe.contentWindow.postMessage({ __jibo: true, kind: 'listening', on: false }, '*'); } catch (_) { /* iframe gone */ }
+  }
+
   // Mic button -> a real robot-style audio turn (server-side ASR): the iframe's
   // hub-bridge opens LISTEN with no mode and streams mic PCM to the gateway.
   // The returned promise holds the ⏺ recording indicator until the turn settles
@@ -378,12 +411,39 @@ async function startSkillRuntime() {
       return;
     }
     return new Promise((resolve) => {
-      voiceDone = resolve;
-      setTimeout(() => { if (voiceDone === resolve) { voiceDone = null; resolve(); } }, 60000);
+      const settle = () => { stopListeningCue(); resolve(); };
+      voiceDone = settle;
+      startListeningCue();                  // ring + eye go blue the moment we start listening
+      setTimeout(() => { if (voiceDone === settle) { voiceDone = null; settle(); } }, 60000);
       try { iframe.contentWindow.postMessage({ __jibo: true, kind: 'voice-turn' }, '*'); }
-      catch (_) { voiceDone = null; resolve(); }
+      catch (_) { voiceDone = null; settle(); }
     });
   });
+
+  // "Hey Jibo" wake word: an always-on, fully on-device detector (openWakeWord
+  // models run via onnxruntime-web — mic audio never leaves the browser). It's
+  // opt-in (the topbar toggle is the user gesture that grants mic + starts it).
+  // On detection we just press the same path the mic button does, so the wake
+  // phrase fires a real server-side voice turn with the blue listening cue.
+  const wakeToggle = document.getElementById('wake-toggle');
+  if (wakeToggle) {
+    const wake = createWakeWord({
+      onWake: () => {
+        // triggerVoice() no-ops if a turn is already in flight, so a stray
+        // re-detection mid-turn won't stack a second capture.
+        if (chat.triggerVoice()) chat.addSystemMessage('\u{1F3A4} “Hey Jibo” — listening…');
+      },
+      onStatus: (s) => {
+        if (s && s.error) { chat.addSystemMessage('\u{1F3A4} Wake word: ' + s.error); wakeToggle.checked = false; }
+        else if (s && s.phrase) wakeToggle.title = `Always-on wake word active: "${s.phrase}"`;
+      },
+    });
+    wakeToggle.disabled = false;
+    wakeToggle.addEventListener('change', () => {
+      if (wakeToggle.checked) wake.start();
+      else wake.stop();
+    });
+  }
 
   // jibo.animate: keyframed gestures driving the rig (body + LED) and eye.
   const animation = createAnimationService({

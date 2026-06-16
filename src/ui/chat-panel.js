@@ -67,6 +67,15 @@ export function installChatPanel(panelEl) {
       voiceHandler = fn;
       micBtn.disabled = !fn;
     },
+    // Programmatically start a voice turn (e.g. from wake-word detection),
+    // reusing the mic button's exact path — same recording UI, same handler.
+    // No-op (returns false) if the button is disabled, i.e. a turn is already
+    // in flight, so a "Hey Jibo" mid-turn can't stack a second capture.
+    triggerVoice() {
+      if (micBtn.disabled || !voiceHandler) return false;
+      micBtn.click();
+      return true;
+    },
     setPlaceholder: (text) => { if (text) input.placeholder = text; },
     addUserMessage: (text) => addMessage('user', text),
     addJiboMessage: (text) => addMessage('jibo', text),
