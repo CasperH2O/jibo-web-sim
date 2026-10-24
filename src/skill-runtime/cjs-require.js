@@ -592,7 +592,8 @@ function _buildHubMessages(path, body, transID) {
         earlyEOS: body.earlyEOS || [],
         encoding: 'LINEAR16',
         sampleRate: 16000,
-        sosTimeout: body.sosTimeout > 0 ? Math.round(body.sosTimeout * 1000) : -1,
+        // Skills wait ~4 s for speech; typing a reply in Chat takes longer, so give the listen at least 20 s.
+        sosTimeout: body.sosTimeout > 0 ? Math.max(20000, Math.round(body.sosTimeout * 1000)) : -1,
         maxSpeechTimeout: body.maxSpeechTimeout > 0 ? Math.round(body.maxSpeechTimeout * 1000) : -1,
       };
     }
