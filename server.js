@@ -141,10 +141,20 @@ app.get('/__list', (req, res) => {
     try { entries = readdirSync(absDir, { withFileTypes: true }); } catch (_) { return; }
     for (const e of entries) {
       const url = `${urlDir}/${e.name}`;
-      if (e.isDirectory()) walk(join(absDir, e.name), url);
+      const abs = join(absDir, e.name);
+      // Local resurrection workspaces keep proprietary bundles outside this
+      // repository and expose them through controlled directory symlinks.
+      // Dirent reports those as links, so consult stat() before deciding
+      // whether to recurse. express.static follows the same links when the
+      // browser later requests a discovered file.
+      let isDirectory = e.isDirectory();
+      if (!isDirectory && e.isSymbolicLink()) {
+        try { isDirectory = statSync(abs).isDirectory(); } catch (_) { /* broken link */ }
+      }
+      if (isDirectory) walk(abs, url);
       else {
         let size = 0;
-        try { size = statSync(join(absDir, e.name)).size; } catch (_) { /* keep 0 */ }
+        try { size = statSync(abs).size; } catch (_) { /* keep 0 */ }
         files.push({ url, size });
       }
     }
