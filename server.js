@@ -10,7 +10,7 @@ import { execFileSync } from 'node:child_process';
 import { WebSocketServer, WebSocket as WS } from 'ws';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize } from 'node:path';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
 
 // Cloud hub auth: the hub accepts a Bearer JWT signed with HS256. The secret
 // and credential identifiers are fully configurable via env vars — any
@@ -233,6 +233,21 @@ app.use('/__cloud', express.raw({ type: '*/*', limit: '32mb' }), (req, res) => {
   upreq.on('error', (e) => { res.status(502).type('text/plain').send(`upstream error: ${e.message}`); });
   if (req.body && req.body.length) upreq.write(req.body);
   upreq.end();
+});
+
+// Chat mirror: the browser POSTs each chat message (see main.js) and we append
+// it as one JSON line to $CHAT_LOG so the conversation is readable outside the
+// browser. Disabled (204, nothing written) when CHAT_LOG is unset.
+const CHAT_LOG = process.env.CHAT_LOG || '';
+app.post('/__chatlog', express.json({ type: '*/*', limit: '64kb' }), (req, res) => {
+  const { ts, who, text, skill, server } = req.body || {};
+  if (CHAT_LOG && typeof who === 'string' && typeof text === 'string') {
+    try {
+      mkdirSync(dirname(CHAT_LOG), { recursive: true });
+      appendFileSync(CHAT_LOG, JSON.stringify({ ts, who, text, skill, server }) + '\n');
+    } catch (e) { console.error('chatlog write failed:', e.message); }
+  }
+  res.status(204).end();
 });
 
 // Browser defaults to fetching /favicon.ico — a 204 keeps the address bar

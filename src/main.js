@@ -68,7 +68,14 @@ document.getElementById('btn-front-view').addEventListener('click', () => viewpo
 
 installTabs(document.getElementById('tabs'), panelsEl);
 installRigPanel(panelsEl.querySelector('[data-panel="rig"]'), viewport.rig);
-const chat = installChatPanel(panelsEl.querySelector('[data-panel="chat"]'));
+// Mirror the chat to the dev server (POST /__chatlog -> $CHAT_LOG) so the
+// conversation can be read outside the browser. Fire-and-forget.
+const chat = installChatPanel(panelsEl.querySelector('[data-panel="chat"]'), {
+  onMessage: (who, text) => {
+    const entry = { ts: new Date().toISOString(), who, text, skill: skillPicker.value, server: getServer() || null };
+    navigator.sendBeacon('/__chatlog', new Blob([JSON.stringify(entry)], { type: 'application/json' }));
+  },
+});
 const ttsPanel = installTtsPanel(panelsEl.querySelector('[data-panel="tts"]'));
 
 // LPS target + audio events are wired once the runtime is up; the panels

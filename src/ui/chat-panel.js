@@ -4,8 +4,11 @@
 // message and handed to the send handler (wired to AsrService.recognize in
 // main.js), which delivers it to the skill as recognized speech. Jibo's TTS
 // responses are logged back via addJiboMessage().
+//
+// Every message also goes to the optional onMessage(who, text) hook so the host
+// can mirror the conversation somewhere outside the DOM (see main.js).
 
-export function installChatPanel(panelEl) {
+export function installChatPanel(panelEl, { onMessage } = {}) {
   panelEl.innerHTML = '';
   panelEl.classList.add('chat-panel');
 
@@ -46,6 +49,9 @@ export function installChatPanel(panelEl) {
     row.textContent = text;
     log.appendChild(row);
     log.scrollTop = log.scrollHeight;
+    if (onMessage) {
+      try { onMessage(who, text); } catch (_) { /* mirroring must never break the chat */ }
+    }
   }
 
   form.addEventListener('submit', (ev) => {
