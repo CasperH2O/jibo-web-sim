@@ -282,7 +282,10 @@ async function bootReal() {
       return;
     }
     if (m.kind === 'utterance' && typeof m.text === 'string' && m.text.trim()) {
-      const text = m.text.trim();
+      // Real ASR returns lowercase text without punctuation, and the NLU grammars rely on that
+      // ("Tell me a joke." parses as a general question, "tell me a joke" as a joke).
+      const text = m.text.trim().toLowerCase().replace(/[.,!?;:"“”]/g, '').replace(/\s+/g, ' ').trim();
+      if (!text) return;
       // Stop in-flight Web Speech immediately so the MIM can transition past speak.
       // Without this the bundle's MimSkill.onSpeechEvent sees current=speak and
       // takes the spoofed CLIENT_NLU path, leaving the MIM stuck on raw intent
