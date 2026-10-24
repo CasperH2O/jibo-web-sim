@@ -64,6 +64,7 @@ const panelsEl = document.getElementById('tab-panels');
 const viewport = createViewport(viewportEl);
 
 resetBtn.addEventListener('click', () => viewport.resetView());
+document.getElementById('btn-front-view').addEventListener('click', () => viewport.frontView());
 
 installTabs(document.getElementById('tabs'), panelsEl);
 installRigPanel(panelsEl.querySelector('[data-panel="rig"]'), viewport.rig);
@@ -73,9 +74,11 @@ const ttsPanel = installTtsPanel(panelsEl.querySelector('[data-panel="tts"]'));
 // LPS target + audio events are wired once the runtime is up; the panels
 // delegate through these.
 let setActiveTarget = () => {};
+let followCamera = () => {};
 let fireAudioEvent = () => {};
 const lpsPanel = installLpsPanel(panelsEl.querySelector('[data-panel="lps"]'), {
   onSetTarget: (t) => setActiveTarget(t),
+  onFollowCamera: () => followCamera(),
   onPlacementMode: (on) => viewport.setPlacement(on ? (pt) => setActiveTarget(pt) : null),
 });
 installAudioPanel(panelsEl.querySelector('[data-panel="audio"]'), {
@@ -616,7 +619,12 @@ async function startSkillRuntime() {
   let beTarget = null;
   const applyAttention = () => lookat.setTarget(audioAttention || beTarget || lpsTarget);
 
+  // While true, lpsTarget is re-pointed at the viewport camera every frame.
+  // Any explicit target (or clearing it) ends the follow.
+  let followingCamera = false;
+
   setActiveTarget = (pt) => {
+    followingCamera = false;
     lpsTarget = pt ? { x: pt.x, y: pt.y, z: pt.z } : null;
     lps.setTarget(lpsTarget);
     marker.visible = !!lpsTarget;
@@ -624,6 +632,20 @@ async function startSkillRuntime() {
     lpsPanel.showTarget(lpsTarget);
     applyAttention();
   };
+
+  followCamera = () => {
+    followingCamera = true;
+    lpsTarget = viewport.camera.position.clone();
+    lps.setTarget(lpsTarget);          // skills see the camera position as of now
+    marker.visible = false;
+    lpsPanel.showTarget(null, 'Following viewport camera');
+    applyAttention();
+  };
+  viewport.onFrame(() => {
+    if (!followingCamera) return;
+    lpsTarget.copy(viewport.camera.position);
+    applyAttention();
+  });
 
   // Audio events: spawn a ping, glance toward it, notify the skill, then revert.
   const audioViz = [];

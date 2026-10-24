@@ -15,6 +15,8 @@ export function createViewport(hostEl) {
   // Jibo stands ~0.34 m tall, base resting at y≈0, face pointing +X.
   const defaultCamPos = new THREE.Vector3(0.42, 0.28, 0.42);
   const defaultLookAt = new THREE.Vector3(0, 0.15, 0);
+  // On Jibo's facing axis (+X), so the "Front" look-at preset aims into the lens.
+  const frontCamPos = new THREE.Vector3(0.7, 0.26, 0);
   camera.position.copy(defaultCamPos);
   camera.lookAt(defaultLookAt);
 
@@ -149,6 +151,11 @@ export function createViewport(hostEl) {
     controls.target.copy(defaultLookAt);
   }
 
+  function frontView() {
+    camera.position.copy(frontCamPos);
+    controls.target.copy(defaultLookAt);
+  }
+
   function dispose() {
     cancelAnimationFrame(raf);
     ro.disconnect();
@@ -158,6 +165,7 @@ export function createViewport(hostEl) {
   return {
     threeRevision: THREE.REVISION,
     resetView,
+    frontView,
     dispose,
     onFrame,
     setPlacement,

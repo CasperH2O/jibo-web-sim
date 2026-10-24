@@ -2,8 +2,9 @@
 //
 // Preset buttons drop a target at a point around Jibo; a checkbox enables
 // click-to-place in the 3D viewport. "Clear" removes the target. `onSetTarget`
-// receives a {x,y,z} world point (or null to clear); `onPlacementMode(bool)`
-// toggles viewport click-to-place.
+// receives a {x,y,z} world point (or null to clear); `onFollowCamera()` makes
+// Jibo track the viewport camera as it moves; `onPlacementMode(bool)` toggles
+// viewport click-to-place.
 
 // Jibo's face sits at ~(0.03, 0.26, 0) facing +X; presets ring that point.
 const PRESETS = {
@@ -14,7 +15,7 @@ const PRESETS = {
   Down: { x: 0.5, y: -0.05, z: 0.0 },
 };
 
-export function installLpsPanel(panelEl, { onSetTarget, onPlacementMode }) {
+export function installLpsPanel(panelEl, { onSetTarget, onFollowCamera, onPlacementMode }) {
   panelEl.innerHTML = '';
   panelEl.classList.add('lps-panel');
   panelEl.innerHTML = `
@@ -28,6 +29,7 @@ export function installLpsPanel(panelEl, { onSetTarget, onPlacementMode }) {
         <button type="button" data-preset="Front">Front</button>
         <button type="button" data-preset="Right">Right</button>
         <button type="button" data-preset="Down">Down</button>
+        <button type="button" id="lps-camera" title="Jibo keeps looking at the viewport camera, wherever you orbit it">Camera</button>
       </div>
     </section>
     <section class="rig-section">
@@ -38,8 +40,8 @@ export function installLpsPanel(panelEl, { onSetTarget, onPlacementMode }) {
   `;
 
   const readout = panelEl.querySelector('#lps-readout');
-  function showTarget(t) {
-    readout.textContent = t ? `Target: (${t.x.toFixed(2)}, ${t.y.toFixed(2)}, ${t.z.toFixed(2)})` : 'No target';
+  function showTarget(t, label) {
+    readout.textContent = label || (t ? `Target: (${t.x.toFixed(2)}, ${t.y.toFixed(2)}, ${t.z.toFixed(2)})` : 'No target');
   }
 
   for (const btn of panelEl.querySelectorAll('[data-preset]')) {
@@ -49,6 +51,7 @@ export function installLpsPanel(panelEl, { onSetTarget, onPlacementMode }) {
       showTarget(t);
     });
   }
+  panelEl.querySelector('#lps-camera').addEventListener('click', () => onFollowCamera());
   panelEl.querySelector('#lps-clear').addEventListener('click', () => {
     onSetTarget(null);
     showTarget(null);
