@@ -114,13 +114,19 @@ serverInput.addEventListener('change', () => {
   if (switchSkill && skillPicker.value) switchSkill(skillPicker.value);
 });
 
-// Robot backend. ?backend=robot-os uses Jibo's real expression service running in a
-// local robot-os process (relayed by server.js under /robot/*); otherwise the page
-// emulates the robot's services itself. Probed once; if robot-os is not answering
-// the page says so and stays on the local backend.
+// Robot backend. 'robot-os' uses Jibo's real expression service running in a local
+// robot-os process (relayed by server.js under /robot/*); 'local' has the page emulate
+// the robot's services itself. ?backend=local|robot-os picks one; without it the
+// server's default applies (/robot/config, local unless configured). Probed once; if
+// robot-os is not answering the page says so and stays on the local backend.
 const backendBadge = document.getElementById('backend-badge');
 const robotBackend = (async () => {
-  if (new URLSearchParams(location.search).get('backend') !== 'robot-os') return 'local';
+  let wanted = new URLSearchParams(location.search).get('backend');
+  if (wanted !== 'local' && wanted !== 'robot-os') {
+    wanted = await fetch('/robot/config', { cache: 'no-store' })
+      .then((res) => res.json()).then((config) => config.defaultBackend, () => 'local');
+  }
+  if (wanted !== 'robot-os') return 'local';
   try {
     const res = await fetch('/robot/status', { cache: 'no-store' });
     const status = await res.json();

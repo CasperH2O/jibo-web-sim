@@ -253,6 +253,8 @@ app.post('/__chatlog', express.json({ type: '*/*', limit: '64kb' }), (req, res) 
 // robot-os: Jibo's real expression service plus a state hub, running as a separate
 // local Node process (the resurrection workspace's robot-os/launcher.mjs). The
 // browser only ever talks to this server; these relays forward to 127.0.0.1.
+//   GET /robot/config        -> {defaultBackend}: the backend the page uses without
+//                            ?backend= (ROBOT_BACKEND=local|robot-os, default local)
 //   GET /robot/status        -> hub /status (503 JSON when robot-os is not running)
 //   WS  /robot/expression    -> expression service RemoteClient socket
 //   WS  /robot/state, /lps   -> hub /state, /lps
@@ -263,6 +265,10 @@ app.post('/__chatlog', express.json({ type: '*/*', limit: '64kb' }), (req, res) 
 const ROBOT_OS_EXPRESSION_PORT = Number(process.env.ROBOT_OS_EXPRESSION_PORT) || 10015;
 const ROBOT_OS_HUB_PORT = Number(process.env.ROBOT_OS_HUB_PORT) || 8190;
 const ROBOT_OS_LPS_PORT = Number(process.env.ROBOT_OS_LPS_PORT) || 8484;
+const ROBOT_BACKEND = process.env.ROBOT_BACKEND === 'robot-os' ? 'robot-os' : 'local';
+if (process.env.ROBOT_BACKEND && process.env.ROBOT_BACKEND !== ROBOT_BACKEND) {
+  console.warn(`ROBOT_BACKEND must be 'local' or 'robot-os' (got '${process.env.ROBOT_BACKEND}'); using local`);
+}
 const ROBOT_OS_LPS_PREFIX = '/robot/lps-service/';
 const ROBOT_OS_ROUTES = {
   '/robot/expression': `ws://127.0.0.1:${ROBOT_OS_EXPRESSION_PORT}/`,
@@ -289,6 +295,10 @@ app.use(ROBOT_OS_LPS_PREFIX, express.raw({ type: '*/*', limit: '1mb' }), async (
   } catch (e) {
     res.status(503).json({ ok: false, error: `robot-os LPS not reachable on 127.0.0.1:${ROBOT_OS_LPS_PORT} (${e.message})` });
   }
+});
+app.get('/robot/config', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ defaultBackend: ROBOT_BACKEND });
 });
 app.get('/robot/status', async (req, res) => {
   res.set('Cache-Control', 'no-store');
