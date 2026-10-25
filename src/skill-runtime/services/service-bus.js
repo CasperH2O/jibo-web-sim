@@ -20,7 +20,19 @@ export class ServiceBus {
     this.services = new Map();        // name -> { name, port, impl }
     this.byPort = new Map();          // port -> entry
     this.clientsByPort = new Map();   // port -> Set<RemoteClient>
+    this.externalPorts = new Set();   // ports served by a real process, not the bus
     this._nextPort = 9100;
+  }
+
+  // Point a service at a real process outside the page (robot-os) instead of a
+  // local impl. Its record carries the real port, and RemoteClients that init on
+  // that port keep the client framework's own socket transport (see install()),
+  // which the `ws` shim routes to the dev server's relay.
+  external(name, port) {
+    const old = this.services.get(name);
+    if (old) this.byPort.delete(old.port);
+    this.services.set(name, { name, port, impl: null, external: true });
+    this.externalPorts.add(port);
   }
 
   // Register a service impl. `impl.handle(instanceId, methodName, args) -> result|Promise`
@@ -166,17 +178,21 @@ export class ServiceBus {
     const RemoteClient = cf.RemoteClient;
     if (RemoteClient && RemoteClient.prototype && !RemoteClient.prototype.__busPatched) {
       RemoteClient.prototype.__busPatched = true;
+      const { init: realInit, sendMessage: realSendMessage, destroy: realDestroy } = RemoteClient.prototype;
       RemoteClient.prototype.init = function init(port) {
+        if (bus.externalPorts.has(port)) { this._external = true; return realInit.call(this, port); }
         this.port = port;
         this._isInitialized = true;
         bus._addClient(port, this);
         return Promise.resolve();
       };
       RemoteClient.prototype.sendMessage = function sendMessage(instanceId, methodName, args, sendAndForget) {
+        if (this._external) return realSendMessage.call(this, instanceId, methodName, args, sendAndForget);
         const p = bus.handleRequest(this.port, instanceId, methodName, args);
         return sendAndForget ? undefined : p;
       };
       RemoteClient.prototype.destroy = function destroy() {
+        if (this._external) return realDestroy.call(this);
         const set = bus.clientsByPort.get(this.port);
         if (set) set.delete(this);
       };

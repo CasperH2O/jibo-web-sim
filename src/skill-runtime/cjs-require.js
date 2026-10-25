@@ -1014,8 +1014,10 @@ function makeFakeWs() {
 
   // Bridge a real browser WebSocket to the `ws`-package event
   // interface, so the configured backend server is actually reached
-  // instead of the in-memory fake.
-  function realSocket(url) {
+  // instead of the in-memory fake. `hub: false` is a plain pipe: no
+  // __hubSockets registration and no Hubmsg -> WSmsg rewriting (used for
+  // robot-os service sockets, which speak the RemoteClient protocol).
+  function realSocket(url, { hub = true } = {}) {
     const sock = new Socket();
     sock.url = url;
     sock.readyState = 0;
@@ -1023,7 +1025,7 @@ function makeFakeWs() {
     try { real = new window.WebSocket(url); } catch (e) { setTimeout(() => sock.emit('error', e), 0); return sock; }
     real.onopen = () => {
       sock.readyState = 1;
-      try { const h = hostFromUrl(url); if (h && typeof window !== 'undefined' && window.__hubSockets) window.__hubSockets[h] = real; } catch (_) {}
+      if (hub) try { const h = hostFromUrl(url); if (h && typeof window !== 'undefined' && window.__hubSockets) window.__hubSockets[h] = real; } catch (_) {}
       sock.emit('open');
     };
     // The cloud hub speaks Hubmsg {type, ts, msgID, transID, ...} on
@@ -1037,7 +1039,7 @@ function makeFakeWs() {
     // that lack a transID).
     real.onmessage = (ev) => {
       let data = ev.data;
-      if (typeof data === 'string' && data.charCodeAt(0) === 123 /* { */) {
+      if (hub && typeof data === 'string' && data.charCodeAt(0) === 123 /* { */) {
         try {
           const obj = JSON.parse(data);
           if (obj && !obj.requestID) {
@@ -1051,7 +1053,7 @@ function makeFakeWs() {
     };
     real.onclose = () => {
       sock.readyState = 3;
-      try { const h = hostFromUrl(url); if (h && typeof window !== 'undefined' && window.__hubSockets && window.__hubSockets[h] === real) delete window.__hubSockets[h]; } catch (_) {}
+      if (hub) try { const h = hostFromUrl(url); if (h && typeof window !== 'undefined' && window.__hubSockets && window.__hubSockets[h] === real) delete window.__hubSockets[h]; } catch (_) {}
       sock.emit('close');
     };
     real.onerror = (e) => sock.emit('error', e);
@@ -1062,6 +1064,12 @@ function makeFakeWs() {
   }
 
   function WebSocket(url) {
+    // Services that run in a real local process (robot-os) are reached
+    // through the dev server's relay: window.__ROBOT_WS_ROUTES__ maps the
+    // client framework's hard-coded ws://127.0.0.1:<port> to it (boot.js).
+    const routes = (typeof window !== 'undefined' && window.__ROBOT_WS_ROUTES__) || null;
+    const routed = routes && routes[String(url).replace(/\/$/, '')];
+    if (routed) return realSocket(routed, { hub: false });
     const server = (typeof window !== 'undefined' && window.__JIBO_SERVER__) || '';
     // The cloud hub uses per-turn WS connections WITH custom upgrade
     // headers (X-JIBO-transID). Browsers can't set those, so the

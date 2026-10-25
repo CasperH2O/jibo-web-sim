@@ -106,6 +106,40 @@ const entry = params.get('entry') || 'index.html';
 // malformed `host:port:9000`. IPv6 in brackets is left alone.
 const server = (params.get('server') || '').trim().replace(/(?<!:):\d+$/, '');
 if (server) window.__JIBO_SERVER__ = server;
+// Robot backend, chosen by the host page: 'local' (default) emulates the robot's
+// services in the page; 'robot-os' uses Jibo's real expression service running in a
+// local robot-os process, reached through the dev server's /robot/* relays.
+window.__ROBOT_BACKEND__ = params.get('backend') === 'robot-os' ? 'robot-os' : 'local';
+
+// In robot-os mode, learn the real service ports and route the client framework's
+// hard-coded ws://127.0.0.1:<port> to the relay. Falls back to local if robot-os
+// is not answering.
+async function connectRobotOs() {
+  if (window.__ROBOT_BACKEND__ !== 'robot-os') return null;
+  try {
+    const res = await fetch('/robot/status', { cache: 'no-store' });
+    const status = await res.json();
+    if (!res.ok || !status.ok) throw new Error(status.error || `status ${res.status}`);
+    const port = status.ports.expression;
+    const wsBase = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}`;
+    window.__ROBOT_WS_ROUTES__ = { [`ws://127.0.0.1:${port}`]: `${wsBase}/robot/expression` };
+    // The skill's directory on the robot-os machine, for expression.setSkillRoot.
+    const skillRoot = status.skillsDir && dir.startsWith('/skills/') ? `${status.skillsDir}${dir.slice('/skills'.length)}` : null;
+    window.__ROBOT_OS__ = { expressionPort: port, skillUrl: dir, skillRoot };
+    console.log('[robot-os] backend active; expression service on port', port, 'skill root', skillRoot);
+    return window.__ROBOT_OS__;
+  } catch (e) {
+    console.warn('[robot-os] not reachable, falling back to the local backend:', e.message);
+    window.__ROBOT_BACKEND__ = 'local';
+    return null;
+  }
+}
+
+// Tell the host which backend this skill actually runs on, so it knows whether
+// to drive the body from robot-os or from the skill's own messages.
+function reportBackend() {
+  try { window.parent.postMessage({ __jibo: true, kind: 'robot-backend', backend: window.__ROBOT_BACKEND__ }, '*'); } catch (_) { /* no parent */ }
+}
 
 // Run the bundle's index.html: inject its styles + body DOM, then run its scripts
 // (external src resolved against the bundle dir; inline via eval).
@@ -161,6 +195,8 @@ async function bootReal() {
   commonGlobals(req);
   window.process = req('process');
   window.process.env.RUNMODE = 'UNIT_TESTS';   // robot-service plugins skip cleanly offline
+  const robotOs = await connectRobotOs();
+  reportBackend();
 
   // Preload the eye config so we can fill in what the (absent) expression service
   // would provide BEFORE the runtime's init runs.
@@ -179,6 +215,7 @@ async function bootReal() {
         // Connect the bundle's service clients to the in-memory service bus
         // (the in-browser stand-in for localhost services).
         try { if (!window.__serviceBus) window.__serviceBus = installServiceBus(req); } catch (e) { console.warn('[boot] service bus:', e.message); }
+        if (robotOs && window.__serviceBus) window.__serviceBus.external('expression', robotOs.expressionPort);
         // The service-records plugin is skipped under UNIT_TESTS, so jibo.records is empty
         // and clients have no host:port. Populate it from the bus so they connect to us.
         try { if (window.__serviceBus) v.records = window.__serviceBus.records(); } catch (e) { console.warn('[boot] records:', e.message); }
@@ -406,6 +443,11 @@ async function bootReal() {
 
 // SHIM mode: our lightweight runtime.
 function bootShim() {
+  // The shim emulates every service itself; robot-os only serves bundles that ship
+  // the real runtime.
+  if (window.__ROBOT_BACKEND__ === 'robot-os') console.warn('[robot-os] shim skill: using the local backend');
+  window.__ROBOT_BACKEND__ = 'local';
+  reportBackend();
   const jibo = installJiboShim();
   window.jibo = jibo;
   if (jibo.utils && jibo.utils.PathUtils && jibo.utils.PathUtils.setRoot) jibo.utils.PathUtils.setRoot(dir);

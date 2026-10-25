@@ -114,6 +114,19 @@ export function installRigPanel(panelEl, rig) {
     }
   });
 
+  // With the robot-os backend the rig follows the real body service, so manual
+  // controls would only be overwritten on the next state frame.
+  const externalNote = document.createElement('p');
+  externalNote.className = 'rig-note';
+  externalNote.hidden = true;
+  externalNote.textContent = 'Driven by robot-os: the body and LED ring follow Jibo\'s real expression service. Manual controls are off.';
+  panelEl.prepend(externalNote);
+  function setExternallyDriven(on) {
+    if (on) stopAnimations();
+    externalNote.hidden = !on;
+    for (const el of panelEl.querySelectorAll('input, button')) el.disabled = on;
+  }
+
   // --- LED animation helpers (local state, no globals) ---
   let animHandle = 0;
   function stopAnimations() {
@@ -146,6 +159,8 @@ export function installRigPanel(panelEl, rig) {
     };
     animHandle = requestAnimationFrame(tick);
   }
+
+  return { setExternallyDriven };
 }
 
 function hslToHex(h, s, l) {

@@ -250,6 +250,33 @@ app.post('/__chatlog', express.json({ type: '*/*', limit: '64kb' }), (req, res) 
   res.status(204).end();
 });
 
+// robot-os: Jibo's real expression service plus a state hub, running as a separate
+// local Node process (the resurrection workspace's robot-os/launcher.mjs). The
+// browser only ever talks to this server; these relays forward to 127.0.0.1.
+//   GET /robot/status        -> hub /status (503 JSON when robot-os is not running)
+//   WS  /robot/expression    -> expression service RemoteClient socket
+//   WS  /robot/state, /lps   -> hub /state, /lps
+const ROBOT_OS_EXPRESSION_PORT = Number(process.env.ROBOT_OS_EXPRESSION_PORT) || 10015;
+const ROBOT_OS_HUB_PORT = Number(process.env.ROBOT_OS_HUB_PORT) || 8190;
+const ROBOT_OS_ROUTES = {
+  '/robot/expression': `ws://127.0.0.1:${ROBOT_OS_EXPRESSION_PORT}/`,
+  '/robot/state': `ws://127.0.0.1:${ROBOT_OS_HUB_PORT}/state`,
+  '/robot/lps': `ws://127.0.0.1:${ROBOT_OS_HUB_PORT}/lps`,
+};
+app.get('/robot/status', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const upstream = await fetch(`http://127.0.0.1:${ROBOT_OS_HUB_PORT}/status`, { signal: AbortSignal.timeout(1500) });
+    if (!upstream.ok) throw new Error(`hub answered ${upstream.status}`);
+    // skillsDir: the directory served at /skills. robot-os runs on this machine and
+    // reads animation files itself, so the skill runtime turns its /skills/<name>
+    // URL into this path for expression.setSkillRoot.
+    res.json({ ...(await upstream.json()), skillsDir: EXTERNAL_SKILLS });
+  } catch (e) {
+    res.status(503).json({ ok: false, error: `robot-os not reachable on 127.0.0.1:${ROBOT_OS_HUB_PORT} (${e.message})` });
+  }
+});
+
 // Browser defaults to fetching /favicon.ico — a 204 keeps the address bar
 // from showing a 404 and stops devtools from logging it on every reload.
 app.get('/favicon.ico', (req, res) => res.status(204).end());
@@ -301,6 +328,8 @@ if (process.env.HTTPS === '1' || process.env.HTTPS_PORT) {
 // the X-JIBO-transID / X-JIBO-robotID headers on the upstream handshake.
 const wss = new WebSocketServer({ noServer: true });
 const onUpgrade = (req, sock, head) => {
+  const robotUpstream = req.url && ROBOT_OS_ROUTES[new URL(req.url, 'http://x').pathname];
+  if (robotUpstream) { relayRobotOs(req, sock, head, robotUpstream); return; }
   if (!req.url || !req.url.startsWith('/__cloud-ws')) { sock.destroy(); return; }
   const u = new URL(req.url, 'http://x');
   const upstream = u.searchParams.get('upstream');
@@ -335,5 +364,27 @@ const onUpgrade = (req, sock, head) => {
     clientWS.on('error', cleanup);
   });
 };
+// Pipe a browser socket to a robot-os socket unchanged (text stays text). The
+// client's messages are queued until the upstream opens; if robot-os is not
+// running the browser socket closes with 1011 and the client's own reconnect
+// logic takes over.
+const robotWss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+function relayRobotOs(req, sock, head, upstreamUrl) {
+  robotWss.handleUpgrade(req, sock, head, (clientWS) => {
+    const upstreamWS = new WS(upstreamUrl, { perMessageDeflate: false });
+    const relay = (sink, data, isBinary) => { try { sink.send(isBinary ? data : data.toString('utf8'), { binary: !!isBinary }); } catch (_) { /* sink closed */ } };
+    const pending = [];
+    clientWS.on('message', (data, isBinary) => {
+      if (upstreamWS.readyState === WS.OPEN) relay(upstreamWS, data, isBinary); else pending.push([data, isBinary]);
+    });
+    upstreamWS.on('open', () => { for (const [d, b] of pending) relay(upstreamWS, d, b); pending.length = 0; });
+    upstreamWS.on('message', (data, isBinary) => relay(clientWS, data, isBinary));
+    upstreamWS.on('close', () => { try { clientWS.close(); } catch (_) {} });
+    upstreamWS.on('error', (e) => { try { clientWS.close(1011, `robot-os: ${e.message}`.slice(0, 120)); } catch (_) {} });
+    clientWS.on('close', () => { try { upstreamWS.close(); } catch (_) {} });
+    clientWS.on('error', () => { try { upstreamWS.close(); } catch (_) {} });
+  });
+}
+
 server.on('upgrade', onUpgrade);
 if (httpsServer) httpsServer.on('upgrade', onUpgrade);

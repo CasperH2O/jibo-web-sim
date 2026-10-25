@@ -756,11 +756,64 @@ function extractLookAtTarget(opts) {
   }
   return null;
 }
+// The jibo-expression-client 5.x methods that RPC to the expression service.
+const REAL_EXPRESSION_METHODS = [
+  'createAnimation', 'createAndPlayAnimation', 'destroyCaches', 'acquireTarget',
+  'setAttentionMode', 'pushAttentionMode', 'getAttentionMode', 'setLEDColor', 'awaitFace',
+  'centerRobot', 'cleanup', 'indexRobot', 'setSkillRoot', 'blink', 'doCenterRobotOnDisconnect',
+];
+
+// robot-os backend (boot.js): the bundle's real expression client talks to Jibo's
+// real expression service, so nothing here emulates it. Calls wait until
+// initOfflineServices has run expression.init and setSkillRoot (the runtime skips
+// its own init under UNIT_TESTS), and skill-relative browser paths (/skills/<name>/…)
+// become paths on the robot-os machine, which reads animation files itself.
+// Methods the 5.x client lacks keep the tolerant stub, as in local mode.
+function installRobotOsExpression(ex) {
+  const { skillUrl, skillRoot } = window.__ROBOT_OS__ || {};
+  const toRobotPath = (p) => (typeof p === 'string' && skillRoot && (p === skillUrl || p.startsWith(`${skillUrl}/`)) ? skillRoot + p.slice(skillUrl.length) : p);
+  const real = {};
+  let ready;
+  const whenReady = new Promise((resolve) => { ready = resolve; });
+  for (const m of REAL_EXPRESSION_METHODS) {
+    if (typeof ex[m] !== 'function') continue;
+    real[m] = ex[m];
+    ex[m] = (...args) => whenReady.then(() => {
+      if ((m === 'createAnimation' || m === 'createAndPlayAnimation') && args[0]) {
+        args[0].src = toRobotPath(args[0].src);
+        args[0].path = toRobotPath(args[0].path);
+      } else if (m === 'setSkillRoot') {
+        args[0] = toRobotPath(args[0]);
+      }
+      return real[m].apply(ex, args);
+    });
+  }
+  for (const m of EXPRESSION_METHODS) {
+    if (ex[m] === undefined) ex[m] = () => Promise.resolve(tolerant());
+  }
+  // expression.init replaces ex.events with the client's real emitters. Until then,
+  // hold early subscribers and hand them over (adoptEarlyListeners) once it resolves.
+  const early = { dofs: [], kinematics: [] };
+  const holder = (list) => ({
+    on(cb) { list.push(cb); }, once(cb) { list.push(cb); },
+    off(cb) { const i = list.indexOf(cb); if (i >= 0) list.splice(i, 1); },
+  });
+  if (!ex.events) ex.events = { dofs: holder(early.dofs), kinematics: holder(early.kinematics) };
+  const adoptEarlyListeners = () => {
+    for (const name of Object.keys(early)) {
+      for (const cb of early[name]) { try { ex.events[name].on(cb); } catch (_) { /* */ } }
+    }
+  };
+  ex.__robotOs = { real, ready, skillRoot, adoptEarlyListeners };
+  console.log('[robot-os] expression calls go to the real service:', Object.keys(real).join(','));
+}
+
 export function installExpressionStubs(jibo, requireFn) {
   try {
     const ex = jibo && jibo.expression;
     if (!ex || ex.__stubbed) return;
     ex.__stubbed = true;
+    if (window.__ROBOT_BACKEND__ === 'robot-os') { installRobotOsExpression(ex); return; }
     // Initialize the DOFArbiter against the bundle's robot DOF universe.
     // jibo.expression.dofs.ALL is a DOFSet whose getDOFs() lists every DOF —
     // that's what populateExpressionDofs already built for us.
@@ -1436,6 +1489,7 @@ export function initOfflineServices(jibo, requireFn) {
         if (r && typeof r.then === 'function') {
           r.then(() => {
             try {
+              if (window.__ROBOT_BACKEND__ === 'robot-os') { startRobotOsFace(jibo); return; }
               if (jibo.expression.events && jibo.expression.events.dofs && jibo.face && jibo.face.eye) {
                 jibo.expression.events.dofs.on((data) => {
                   try { jibo.face.eye.display(data.timestamp, data.dofValues, data.metadata); }
@@ -1443,11 +1497,47 @@ export function initOfflineServices(jibo, requireFn) {
                 });
               }
             } catch (_) { /* */ }
-          }).catch((e) => console.warn('[live-eye] expression.init:', e && e.message));
+          }).catch((e) => {
+            console.warn('[live-eye] expression.init:', e && e.message);
+            // Let queued robot-os calls run (and fail visibly) rather than hang.
+            if (jibo.expression.__robotOs) jibo.expression.__robotOs.ready();
+          });
         }
       }
     }
   } catch (e) { console.warn('[live-eye] expression.init:', e.message); }
+}
+
+// robot-os backend, once expression.init resolves: show the real service's dofs on
+// the face (what ExpressionPlugin.init does on the robot), point the service at the
+// skill's directory, then release the calls installRobotOsExpression queued. The
+// face is looked up per event because init can resolve before the FaceRenderer
+// exists.
+function startRobotOsFace(jibo) {
+  const ex = jibo.expression;
+  const ros = ex.__robotOs;
+  const stats = window.__robotOsStats = { dofs: 0, lastDofs: null };
+  ex.events.dofs.on((data) => {
+    stats.dofs += 1;
+    stats.lastDofs = data.dofValues;
+    const eye = jibo.face && jibo.face.eye;
+    if (!eye || !eye.display) return;
+    let dofs = data.dofValues;
+    // Listening cue, as in driveEye: Jibo's listening blue while a voice turn is open.
+    const lis = window.__listeningEye;
+    if (lis) dofs = Object.assign({}, dofs, { eye_redChannelBn_r: lis[0], eye_greenChannelBn_r: lis[1], eye_blueChannelBn_r: lis[2] });
+    try { eye.display(data.timestamp, dofs, data.metadata); } catch (_) { /* eye not ready */ }
+  });
+  ros.adoptEarlyListeners();
+  const rooted = ros.skillRoot
+    ? ros.real.setSkillRoot(ros.skillRoot)
+    : Promise.reject(new Error('skill is not served under /skills; animation files given by path will not load'));
+  return Promise.resolve(rooted)
+    .catch((e) => console.warn('[robot-os] setSkillRoot:', e && e.message))
+    .then(() => {
+      ros.ready();
+      console.log('[robot-os] expression.init resolved; the real service drives the face, skill root', ros.skillRoot);
+    });
 }
 
 // BeSkill.init chains the framework's plugins and aborts the whole
@@ -1533,6 +1623,9 @@ export function installIdleMotion(jibo) {
   jibo.__idleMotionInstalled = true;
 
   const ex = jibo.expression;
+  // robot-os backend: blinks and boredom looks belong to the real expression
+  // service's attention system, so only the skill-level musings stay.
+  const robotOs = window.__ROBOT_BACKEND__ === 'robot-os';
 
   // --- Periodic blinks ---
   function fireBlink() {
@@ -1540,7 +1633,7 @@ export function installIdleMotion(jibo) {
     catch (_) { /* */ }
     setTimeout(fireBlink, 3000 + Math.random() * 10000);   // 3-13s
   }
-  setTimeout(fireBlink, 1500 + Math.random() * 2000);
+  if (!robotOs) setTimeout(fireBlink, 1500 + Math.random() * 2000);
 
   // --- Idle context lookup ---
   // be.currentSkill is a getter that returns the active skill INSTANCE
@@ -1581,7 +1674,7 @@ export function installIdleMotion(jibo) {
     } catch (_) { /* */ }
     setTimeout(boredomLook, 6000 + Math.random() * 7000);    // [6, 13]s
   }
-  setTimeout(boredomLook, 4000 + Math.random() * 3000);
+  if (!robotOs) setTimeout(boredomLook, 4000 + Math.random() * 3000);
 
   // --- Musings (eye-only ambient motion) ---
   let useBig = false;
@@ -1602,7 +1695,8 @@ export function installIdleMotion(jibo) {
   }
   setTimeout(fireMusing, 20000 + Math.random() * 15000);
 
-  console.log('[live-eye] idle motion installed (blinks + boredom look + musings)');
+  console.log(robotOs ? '[live-eye] idle musings installed (robot-os: blinks and boredom looks come from the real service)'
+    : '[live-eye] idle motion installed (blinks + boredom look + musings)');
 }
 
 export function driveEye(jibo, prep) {
@@ -1625,6 +1719,12 @@ export function driveEye(jibo, prep) {
           jibo.face.paused = false;
           texApplied = true;
         } catch (_) { /* not ready yet */ }
+      }
+      // robot-os backend: the real expression service streams the eye's DOFs
+      // (startRobotOsFace); only the texture setup above is needed here.
+      if (window.__ROBOT_BACKEND__ === 'robot-os') {
+        if (!texApplied) requestAnimationFrame(tick);
+        return;
       }
       // Subtle "alive" idle bob; also keeps the DOFs changing so the dirty-check redraws.
       const t = performance.now() / 1000;

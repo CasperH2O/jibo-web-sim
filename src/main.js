@@ -6,6 +6,7 @@
 import * as THREE from 'three';
 import { createViewport } from './viewport/scene.js';
 import { createLookAtController } from './viewport/lookat.js';
+import { createRobotStateDriver } from './viewport/robot-state.js';
 import { installTabs } from './ui/tabs.js';
 import { installRigPanel } from './ui/rig-panel.js';
 import { installChatPanel } from './ui/chat-panel.js';
@@ -62,12 +63,14 @@ const resetBtn = document.getElementById('btn-reset-view');
 const panelsEl = document.getElementById('tab-panels');
 
 const viewport = createViewport(viewportEl);
+// Read-only handle for headless tests (e.g. joint-angle traces via rig.getDof).
+window.__jiboRig = viewport.rig;
 
 resetBtn.addEventListener('click', () => viewport.resetView());
 document.getElementById('btn-front-view').addEventListener('click', () => viewport.frontView());
 
 installTabs(document.getElementById('tabs'), panelsEl);
-installRigPanel(panelsEl.querySelector('[data-panel="rig"]'), viewport.rig);
+const rigPanel = installRigPanel(panelsEl.querySelector('[data-panel="rig"]'), viewport.rig);
 // Mirror the chat to the dev server (POST /__chatlog -> $CHAT_LOG) so the
 // conversation can be read outside the browser. Fire-and-forget.
 const chat = installChatPanel(panelsEl.querySelector('[data-panel="chat"]'), {
@@ -109,6 +112,31 @@ serverInput.addEventListener('change', () => {
   localStorage.setItem('jibo-server', serverInput.value.trim());
   if (switchSkill && skillPicker.value) switchSkill(skillPicker.value);
 });
+
+// Robot backend. ?backend=robot-os uses Jibo's real expression service running in a
+// local robot-os process (relayed by server.js under /robot/*); otherwise the page
+// emulates the robot's services itself. Probed once; if robot-os is not answering
+// the page says so and stays on the local backend.
+const backendBadge = document.getElementById('backend-badge');
+const robotBackend = (async () => {
+  if (new URLSearchParams(location.search).get('backend') !== 'robot-os') return 'local';
+  try {
+    const res = await fetch('/robot/status', { cache: 'no-store' });
+    const status = await res.json();
+    if (!res.ok || !status.ok) throw new Error(status.error || `status ${res.status}`);
+    backendBadge.textContent = 'robot-os';
+    backendBadge.title = `Real expression service (robot-os, Node ${status.node})`;
+    return 'robot-os';
+  } catch (e) {
+    console.warn('[robot-os] not reachable, using the local backend:', e.message);
+    backendBadge.textContent = 'robot-os unreachable: local backend';
+    backendBadge.title = e.message;
+    backendBadge.classList.add('warn');
+    return 'local';
+  } finally {
+    backendBadge.hidden = false;
+  }
+})();
 
 // Skill picker — populated from each bundle's manifest (display-name).
 // Tracks the first dir whose manifest loaded so the boot can default to a
@@ -223,12 +251,31 @@ async function startSkillRuntime() {
   // kept playing alongside the next dance's music.
   const liveSounds = new Map();
   let speechChecked = false;
+
+  // robot-os backend: once the skill iframe reports it is using robot-os, the rig
+  // follows the real body service (/robot/state) and every local writer of body
+  // DOFs stands down: the iframe's animation playback (it no longer posts 'dofs'),
+  // the look-at solver, and the Rig tab's manual controls.
+  const robotState = createRobotStateDriver({ rig: viewport.rig });
+  viewport.onFrame(robotState.update);
+  let resumeLocalAttention = () => {};   // assigned once the look-at solver exists
+  const setRobotDrive = (on) => {
+    if (on === robotState.active) return;
+    if (on) robotState.start(); else robotState.stop();
+    rigPanel.setExternallyDriven(on);
+    if (!on) resumeLocalAttention();
+  };
   if (synth && synth.getVoices().length === 0 && typeof synth.addEventListener === 'function') {
     synth.addEventListener('voiceschanged', () => {}); // nudge async voice load
   }
   window.addEventListener('message', (ev) => {
     const m = ev.data;
     if (!m || m.__jibo !== true) return;
+    if (m.kind === 'robot-backend') {   // which backend the skill iframe actually uses
+      setRobotDrive(m.backend === 'robot-os');
+      return;
+    }
+    if (robotState.active && (m.kind === 'dofs' || m.kind === 'led-color' || m.kind === 'lookat-target' || m.kind === 'lookat-clear')) return;
     if (m.kind === 'heard') {           // server-side ASR transcript echo
       if (m.text) chat.addUserMessage('\u{1F3A4} ' + m.text);
       return;
@@ -600,6 +647,7 @@ async function startSkillRuntime() {
   });
   lookat.calibrate();
   viewport.onFrame(() => {
+    if (robotState.active) return;   // the real attention system drives the body
     lookat.update();
     // Reflect the lookat's current body pose into the iframe so its
     // _bodyState.lastApplied stays in sync. Without this, the next
@@ -624,7 +672,8 @@ async function startSkillRuntime() {
   let lpsTarget = null;
   let audioAttention = null;
   let beTarget = null;
-  const applyAttention = () => lookat.setTarget(audioAttention || beTarget || lpsTarget);
+  const applyAttention = () => { if (!robotState.active) lookat.setTarget(audioAttention || beTarget || lpsTarget); };
+  resumeLocalAttention = applyAttention;
 
   // While true, lpsTarget is re-pointed at the viewport camera every frame.
   // Any explicit target (or clearing it) ends the follow.
@@ -700,7 +749,9 @@ async function startSkillRuntime() {
       // The in-place loader (skill-host.html) sets up jibo + require, then runs
       // the bundle's own index.html unmodified.
       const server = getServer();
-      iframe.src = `/skill-host.html?dir=${encodeURIComponent(skill.dir)}&entry=${encodeURIComponent(skill.main)}${server ? `&server=${encodeURIComponent(server)}` : ''}`;
+      const backend = await robotBackend;
+      setRobotDrive(false);   // until the new iframe reports its backend
+      iframe.src = `/skill-host.html?dir=${encodeURIComponent(skill.dir)}&entry=${encodeURIComponent(skill.main)}${server ? `&server=${encodeURIComponent(server)}` : ''}${backend === 'robot-os' ? '&backend=robot-os' : ''}`;
       if (skillPicker.value !== dir) skillPicker.value = dir;
     } catch (err) {
       console.error('skill load failed:', err);

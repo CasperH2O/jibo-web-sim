@@ -78,12 +78,15 @@ export function createJiboRig(scene) {
 
   // Rotation control update:
   //   frame.quaternion = initialRotation * quat(axis, dofValue)
+  const dofValues = {};       // dofName -> last value applied (rad)
   function setDof(dofName, rad) {
     const c = controls[dofName];
     if (!c) return;
     const spin = new THREE.Quaternion().setFromAxisAngle(c.axis, rad);
     c.frame.quaternion.multiplyQuaternions(c.initialRotation, spin);
+    dofValues[dofName] = rad;
   }
+  const getDof = (dofName) => dofValues[dofName] ?? 0;
   const setBottom = (rad) => setDof('bottomSection_r', rad);
   const setMiddle = (rad) => setDof('middleSection_r', rad);
   const setTop    = (rad) => setDof('topSection_r',    rad);
@@ -257,7 +260,7 @@ export function createJiboRig(scene) {
     get dofMax() { return dofMax; },
     get dofCyclic() { return dofCyclic; },
     dofs: ['bottomSection_r', 'middleSection_r', 'topSection_r'],
-    setBottom, setMiddle, setTop, setDof,
+    setBottom, setMiddle, setTop, setDof, getDof,
     setLEDColor, setLEDHex,
     setScreenHex,
     parts,
