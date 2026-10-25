@@ -1,5 +1,5 @@
 // TTS tab — shows what Jibo is currently saying, plus a short history.
-// Audio itself is produced by the TTS service (Web Speech API).
+// Audio itself is produced by the TTS service (Jibo's voice via robot-os, or Web Speech).
 
 export function installTtsPanel(panelEl) {
   panelEl.innerHTML = '';
@@ -7,8 +7,8 @@ export function installTtsPanel(panelEl) {
   panelEl.innerHTML = `
     <section class="rig-section">
       <h3>Text to speech (TTS)</h3>
-      <p class="rig-note">What Jibo is saying. Audio uses the browser's Web
-      Speech voice (autoplay may require a click on the page first).</p>
+      <p class="rig-note">What Jibo is saying. Voice: <span id="tts-voice">the browser's Web
+      Speech voice</span> (autoplay may require a click on the page first).</p>
       <div class="speech-readout">
         <div class="speech-line"><span class="speech-label">Status</span><span id="tts-status">idle</span></div>
         <div class="speech-current" id="tts-current">—</div>
@@ -22,8 +22,10 @@ export function installTtsPanel(panelEl) {
   const status = panelEl.querySelector('#tts-status');
   const current = panelEl.querySelector('#tts-current');
   const history = panelEl.querySelector('#tts-history');
+  const voice = panelEl.querySelector('#tts-voice');
 
   return {
+    setVoice(label) { voice.textContent = label; },
     setSpeaking(text) {
       if (text) {
         status.textContent = 'speaking';

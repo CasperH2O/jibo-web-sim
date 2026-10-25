@@ -19,6 +19,7 @@ import { createNotificationBanner } from './ui/notification-banner.js';
 import { createAudioEvent } from './viewport/audio-event.js';
 import { createHostBridge } from './bridge/host-bridge.js';
 import { createFaceOverlay } from './bridge/face-overlay.js';
+import { createJiboVoice, probeJiboVoice } from './bridge/jibo-voice.js';
 import { createSessionService } from './bridge/services/session-service.js';
 import { createTtsService } from './bridge/services/tts-service.js';
 import { createNluService } from './bridge/services/nlu-service.js';
@@ -145,6 +146,28 @@ const robotBackend = (async () => {
   }
 })();
 
+// Voice. 'jibo' is the robot's own TTS service, run by robot-os (relayed at /robot/tts/);
+// 'web' is the browser's SpeechSynthesis. ?voice=jibo|web picks one; without it Jibo's
+// voice is used whenever robot-os's TTS bridge answers. Independent of the backend.
+const voiceBadge = document.getElementById('voice-badge');
+const voiceChoice = (async () => {
+  const wanted = new URLSearchParams(location.search).get('voice');
+  const status = wanted === 'web' ? null : await probeJiboVoice();
+  if (status) {
+    voiceBadge.textContent = 'voice: Jibo';
+    voiceBadge.title = `Jibo's own TTS service via robot-os (${status.binary} build)`;
+    voiceBadge.hidden = false;
+    return 'jibo';
+  }
+  if (wanted === 'jibo') {
+    console.warn('[tts] Jibo voice requested but robot-os TTS is not reachable; using browser speech');
+    voiceBadge.textContent = 'robot-os TTS unreachable: browser voice';
+    voiceBadge.classList.add('warn');
+    voiceBadge.hidden = false;
+  }
+  return 'web';
+})();
+
 // Skill picker — populated from each bundle's manifest (display-name).
 // Tracks the first dir whose manifest loaded so the boot can default to a
 // present skill rather than picking a bundle that doesn't have a manifest.
@@ -250,6 +273,9 @@ async function startSkillRuntime() {
   // when it ends so the skill paces to real speech. Keep utterance refs alive to
   // dodge a known Chromium GC-cancels-speech bug.
   const synth = window.speechSynthesis;
+  const voice = await voiceChoice;
+  const jiboVoice = createJiboVoice();
+  if (voice === 'jibo') ttsPanel.setVoice('Jibo\'s own voice (the robot\'s TTS service via robot-os)');
   let voiceDone = null;                 // resolver releasing the mic button when the voice turn settles
   const liveUtters = new Set();
   // id (from iframe's play-sound) -> Audio element currently playing in
@@ -277,6 +303,32 @@ async function startSkillRuntime() {
   if (synth && synth.getVoices().length === 0 && typeof synth.addEventListener === 'function') {
     synth.addEventListener('voiceschanged', () => {}); // nudge async voice load
   }
+  // Speak plain text with the browser's voice; reply() once it has finished (or at once
+  // when there is no SpeechSynthesis).
+  function speakWithBrowser(text, reply) {
+    if (!synth || typeof window.SpeechSynthesisUtterance !== 'function' || !text) { reply(); return; }
+    try {
+      // Diagnose the most common silent-TTS cause once: no installed voices
+      // (typical on Linux Chrome without speech-dispatcher/espeak).
+      if (!speechChecked) {
+        speechChecked = true;
+        const vs = synth.getVoices();
+        if (!vs.length) console.warn('[tts] No SpeechSynthesis voices available — Jibo will be silent. Install a system TTS voice (e.g. speech-dispatcher + espeak-ng on Linux), or use a browser/OS with built-in voices.');
+        else console.log(`[tts] ${vs.length} SpeechSynthesis voice(s) available`);
+      }
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.0;
+      u.pitch = 1.15; // a touch higher — closer to Jibo's voice character
+      const en = synth.getVoices().find((v) => /^en/i.test(v.lang));
+      if (en) u.voice = en;
+      liveUtters.add(u);
+      const done = () => { liveUtters.delete(u); reply(); };
+      u.onend = done;
+      u.onerror = done;
+      try { synth.resume(); } catch (_) { /* Chrome 'paused' quirk */ }
+      synth.speak(u);
+    } catch (_) { reply(); }
+  }
   window.addEventListener('message', (ev) => {
     const m = ev.data;
     if (!m || m.__jibo !== true) return;
@@ -300,30 +352,19 @@ async function startSkillRuntime() {
     if (m.kind === 'speak') {
       const reply = () => { try { iframe.contentWindow.postMessage({ __jibo: true, kind: 'speak-done', id: m.id }, '*'); } catch (_) { /* gone */ } };
       if (m.text) chat.addJiboMessage(m.text);   // every spoken line shows up in Chat
-      if (!synth || typeof window.SpeechSynthesisUtterance !== 'function' || !m.text) { reply(); return; }
-      try {
-        // Diagnose the most common silent-TTS cause once: no installed voices
-        // (typical on Linux Chrome without speech-dispatcher/espeak).
-        if (!speechChecked) {
-          speechChecked = true;
-          const vs = synth.getVoices();
-          if (!vs.length) console.warn('[tts] No SpeechSynthesis voices available — Jibo will be silent. Install a system TTS voice (e.g. speech-dispatcher + espeak-ng on Linux), or use a browser/OS with built-in voices.');
-          else console.log(`[tts] ${vs.length} SpeechSynthesis voice(s) available`);
-        }
-        const u = new SpeechSynthesisUtterance(m.text);
-        u.rate = 1.0;
-        u.pitch = 1.15; // a touch higher — closer to Jibo's voice character
-        const en = synth.getVoices().find((v) => /^en/i.test(v.lang));
-        if (en) u.voice = en;
-        liveUtters.add(u);
-        const done = () => { liveUtters.delete(u); reply(); };
-        u.onend = done;
-        u.onerror = done;
-        try { synth.resume(); } catch (_) { /* Chrome 'paused' quirk */ }
-        synth.speak(u);
-      } catch (_) { reply(); }
-    } else if (m.kind === 'speak-stop' && synth) {
-      try { synth.cancel(); } catch (_) { /* nothing speaking */ }
+      // Jibo's voice gets the robot's own speak request (markup and all); the browser
+      // voice only the plain text.
+      if (voice === 'jibo' && m.request) {
+        jiboVoice.speak(m.request).then(reply, (e) => {
+          console.warn('[tts] Jibo voice failed, using the browser voice:', e.message);
+          speakWithBrowser(m.text, reply);
+        });
+        return;
+      }
+      speakWithBrowser(m.text, reply);
+    } else if (m.kind === 'speak-stop') {
+      jiboVoice.stop();
+      if (synth) { try { synth.cancel(); } catch (_) { /* nothing speaking */ } }
     } else if (m.kind === 'play-sound' && typeof m.src === 'string') {
       // The iframe's AudioContext stays suspended (sandbox blocks user
       // activation), so any sound it tries to play through Web Audio is
@@ -405,6 +446,7 @@ async function startSkillRuntime() {
   const bridge = createHostBridge(iframe);
   bridge.register('session', createSessionService());
   bridge.register('tts', createTtsService({
+    jiboVoice: voice === 'jibo' ? jiboVoice : null,
     emit: (event, data) => bridge.emit('tts', event, data),
     onSubtitle: (text) => {
       setSubtitle(text);
@@ -764,7 +806,7 @@ async function startSkillRuntime() {
       const server = getServer();
       const backend = await robotBackend;
       setRobotDrive(false);   // until the new iframe reports its backend
-      iframe.src = `/skill-host.html?dir=${encodeURIComponent(skill.dir)}&entry=${encodeURIComponent(skill.main)}${server ? `&server=${encodeURIComponent(server)}` : ''}${backend === 'robot-os' ? '&backend=robot-os' : ''}`;
+      iframe.src = `/skill-host.html?dir=${encodeURIComponent(skill.dir)}&entry=${encodeURIComponent(skill.main)}${server ? `&server=${encodeURIComponent(server)}` : ''}${backend === 'robot-os' ? '&backend=robot-os' : ''}${voice === 'jibo' ? '&voice=jibo' : ''}`;
       if (skillPicker.value !== dir) skillPicker.value = dir;
     } catch (err) {
       console.error('skill load failed:', err);

@@ -23,6 +23,28 @@
 // instantly-204 stub — the embodied-dialog timeline finished in 1ms, no
 // posture-shift / per-word motion animations played, and skills paced too
 // fast against the host-window audio.
+//
+// With Jibo's own voice (host passes ?voice=jibo: robot-os runs the robot's TTS
+// service, relayed at /robot/tts/), steps 2 and 4 use the real service: /tts_lex,
+// /tts_pos_tagging and /tts_token_times are forwarded to it (the stubs below remain the
+// fallback), and the host plays /tts_speak's audio from the full robot request.
+const _jiboVoice = typeof location !== 'undefined' && new URLSearchParams(location.search).get('voice') === 'jibo';
+
+// Forward a request to the real TTS service; null when it is unavailable.
+async function _robotTts(path, body) {
+  try {
+    const res = await fetch(`/robot/tts${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    return { status: 200, body: await res.json() };
+  } catch (e) {
+    console.warn(`[tts] robot-os ${path} failed, using the built-in estimate:`, e.message);
+    return null;
+  }
+}
 
 // Pending speak operations keyed by id; resolved by the host's speak-done.
 const _pending = new Map();
@@ -64,7 +86,8 @@ function _estimateMs(plain) {
 // (or the fallback timer fires). Mirrors the inner contract of the
 // embodied-dialog speak: a Promise<void> that paces the surrounding
 // timeline.
-function _speakViaHost(prompt) {
+// `request` is the robot's /tts_speak body; Jibo's voice speaks it as is.
+function _speakViaHost(prompt, request) {
   _ensureBridge();
   const plain = _toPlain(prompt);
   return new Promise((resolve) => {
@@ -74,7 +97,7 @@ function _speakViaHost(prompt) {
     const fin = () => { if (done) return; done = true; _pending.delete(id); clearTimeout(timer); resolve(); };
     _pending.set(id, fin);
     const timer = setTimeout(fin, _estimateMs(plain) + 4000);
-    try { window.parent.postMessage({ __jibo: true, kind: 'speak', id, text: plain }, '*'); }
+    try { window.parent.postMessage({ __jibo: true, kind: 'speak', id, text: plain, request }, '*'); }
     catch (_) { fin(); }
   });
 }
@@ -168,6 +191,15 @@ export const ttsService = {
   handleHttp(method, path, body) {
     let b = {};
     try { b = typeof body === 'string' ? JSON.parse(body) : (body || {}); } catch (_) { /* leave empty */ }
+    if (_jiboVoice) {
+      const forwarded = path.match(/\/(tts_lex|tts_pos_tagging|tts_token_times)\b/);
+      if (forwarded) {
+        return _robotTts(`/${forwarded[1]}`, b).then((res) => res || ttsService._estimate(path, b));
+      }
+    }
+    return ttsService._estimate(path, b);
+  },
+  _estimate(path, b) {
     // Word + punctuation tokens for the NL parser. Each comma / period /
     // question mark / exclamation comes through as its own array entry so
     // the parser can detect sentence ends and connectors. Result shape
@@ -190,7 +222,7 @@ export const ttsService = {
     // The blocking speak — drives Web Speech via host and resolves 204 only
     // after the host's speak-done event so the timeline paces to real audio.
     if (/\/tts_speak/.test(path)) {
-      return _speakViaHost(b.prompt || b.text).then(() => ({ status: 204, body: '' }));
+      return _speakViaHost(b.prompt || b.text, b).then(() => ({ status: 204, body: '' }));
     }
     // Stop — fire-and-forget; the host cancels SpeechSynthesis on 'speak-stop'.
     if (/\/tts_stop/.test(path)) {

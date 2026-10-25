@@ -262,9 +262,13 @@ app.post('/__chatlog', express.json({ type: '*/*', limit: '64kb' }), (req, res) 
 //                            goes to the simulated LPS service, WS (/lps/visual_awareness,
 //                            /lps/audible_awareness) to the hub's mirrors of its streams (the
 //                            service has one subscriber per stream: the attention manager)
+//   /robot/tts/<path>        -> robot-os's TTS bridge (Jibo's real voice, robot-os/tts.mjs):
+//                            /status, /tts_speak (streamed audio/L16), /tts_token_times, ...
+//                            Independent of the backend choice; 503 when it is not running.
 const ROBOT_OS_EXPRESSION_PORT = Number(process.env.ROBOT_OS_EXPRESSION_PORT) || 10015;
 const ROBOT_OS_HUB_PORT = Number(process.env.ROBOT_OS_HUB_PORT) || 8190;
 const ROBOT_OS_LPS_PORT = Number(process.env.ROBOT_OS_LPS_PORT) || 8484;
+const ROBOT_OS_TTS_PORT = Number(process.env.ROBOT_OS_TTS_PORT) || 8189;
 const ROBOT_BACKEND = process.env.ROBOT_BACKEND === 'robot-os' ? 'robot-os' : 'local';
 if (process.env.ROBOT_BACKEND && process.env.ROBOT_BACKEND !== ROBOT_BACKEND) {
   console.warn(`ROBOT_BACKEND must be 'local' or 'robot-os' (got '${process.env.ROBOT_BACKEND}'); using local`);
@@ -295,6 +299,28 @@ app.use(ROBOT_OS_LPS_PREFIX, express.raw({ type: '*/*', limit: '1mb' }), async (
   } catch (e) {
     res.status(503).json({ ok: false, error: `robot-os LPS not reachable on 127.0.0.1:${ROBOT_OS_LPS_PORT} (${e.message})` });
   }
+});
+// Streamed both ways (speech audio arrives while it is being synthesised). A browser that
+// goes away mid-utterance closes the upstream request, which makes the bridge stop speaking.
+app.use('/robot/tts/', (req, res) => {
+  const upstream = http.request({
+    host: '127.0.0.1',
+    port: ROBOT_OS_TTS_PORT,
+    path: req.url,
+    method: req.method,
+    headers: req.headers['content-type'] ? { 'Content-Type': req.headers['content-type'] } : {},
+  }, (up) => {
+    res.status(up.statusCode);
+    res.set('Cache-Control', 'no-store');
+    if (up.headers['content-type']) res.set('Content-Type', up.headers['content-type']);
+    up.pipe(res);
+  });
+  upstream.on('error', (e) => {
+    if (!res.headersSent) res.status(503).json({ ok: false, error: `robot-os TTS not reachable on 127.0.0.1:${ROBOT_OS_TTS_PORT} (${e.message})` });
+    else res.end();
+  });
+  res.on('close', () => { if (!res.writableFinished) upstream.destroy(); });
+  req.pipe(upstream);
 });
 app.get('/robot/config', (req, res) => {
   res.set('Cache-Control', 'no-store');

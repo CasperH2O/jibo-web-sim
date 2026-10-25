@@ -13,12 +13,15 @@
 // the host gates skill start behind a click so the greeting is audible.
 //
 // `emit(event, data)` pushes a 'tts' event to the skill; `onSubtitle(text)`
-// updates host UI (null clears it).
+// updates host UI (null clears it). `jiboVoice` (bridge/jibo-voice.js), when given,
+// speaks instead of Web Speech: Jibo's own voice via robot-os.
 
 const WORDS_PER_MIN = 165;          // a calm Jibo speaking pace
 const MIN_WORD_MS = 180;
+// jibo.tts.speak options the robot's TTS client forwards to the service.
+const ROBOT_SPEAK_OPTIONS = ['duration_stretch', 'pitch', 'pitchBandwidth', 'volume', 'whisper', 'mode'];
 
-export function createTtsService({ emit, onSubtitle }) {
+export function createTtsService({ emit, onSubtitle, jiboVoice = null }) {
   const synth = (typeof window !== 'undefined') ? window.speechSynthesis : null;
   const queue = [];                 // [{ text, options, resolve }]
   let current = null;               // item currently speaking
@@ -37,6 +40,7 @@ export function createTtsService({ emit, onSubtitle }) {
     if (!current) return;
     clearTimers();
     if (cancelAudio && synth) synth.cancel();
+    if (cancelAudio && jiboVoice) jiboVoice.stop();
     onSubtitle(null);
     emit('stop', {});
     const done = current.resolve;
@@ -67,6 +71,27 @@ export function createTtsService({ emit, onSubtitle }) {
       t += perWord;
     });
     const estimatedEnd = t + 400;
+
+    if (jiboVoice && words.length) {
+      // The queue advances when Jibo's audio has finished playing.
+      const request = { prompt: String(text), locale: 'en-us', voice: 'griffin', mode: 'text' };
+      for (const key of ROBOT_SPEAK_OPTIONS) if (options && options[key] != null) request[key] = options[key];
+      jiboVoice.speak(request).then(
+        () => { if (myToken === token) finishCurrent(false); },
+        (e) => {
+          // Use Web Speech from now on, starting with this utterance.
+          console.warn('[tts] Jibo voice failed, using the browser voice:', e.message);
+          jiboVoice = null;
+          if (myToken !== token) return;
+          clearTimers();
+          queue.unshift(current);
+          current = null;
+          token++;
+          playNext();
+        },
+      );
+      return;
+    }
 
     let usedAudio = false;
     if (synth && words.length) {
