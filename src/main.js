@@ -7,6 +7,7 @@ import * as THREE from 'three';
 import { createViewport } from './viewport/scene.js';
 import { createLookAtController } from './viewport/lookat.js';
 import { createRobotStateDriver } from './viewport/robot-state.js';
+import { createRobotLpsLink } from './viewport/robot-lps.js';
 import { installTabs } from './ui/tabs.js';
 import { installRigPanel } from './ui/rig-panel.js';
 import { installChatPanel } from './ui/chat-panel.js';
@@ -255,13 +256,15 @@ async function startSkillRuntime() {
   // robot-os backend: once the skill iframe reports it is using robot-os, the rig
   // follows the real body service (/robot/state) and every local writer of body
   // DOFs stands down: the iframe's animation playback (it no longer posts 'dofs'),
-  // the look-at solver, and the Rig tab's manual controls.
+  // the look-at solver, and the Rig tab's manual controls. The LPS tab's target then
+  // goes to robot-os's LPS service instead, for the real attention manager.
   const robotState = createRobotStateDriver({ rig: viewport.rig });
+  const robotLps = createRobotLpsLink({ rig: viewport.rig });
   viewport.onFrame(robotState.update);
   let resumeLocalAttention = () => {};   // assigned once the look-at solver exists
   const setRobotDrive = (on) => {
     if (on === robotState.active) return;
-    if (on) robotState.start(); else robotState.stop();
+    if (on) { robotState.start(); robotLps.start(); } else { robotState.stop(); robotLps.stop(); }
     rigPanel.setExternallyDriven(on);
     if (!on) resumeLocalAttention();
   };
@@ -669,6 +672,7 @@ async function startSkillRuntime() {
   //   - beTarget:       real-runtime skill calling jibo.expression.acquireTarget
   //                     (lookAt/awaitFace etc.)
   //   - lpsTarget:      persistent target from SHIM-mode jibo.lps.target.set
+  // On robot-os the solver is off and lpsTarget is also sent to robot-os's LPS (robotLps).
   let lpsTarget = null;
   let audioAttention = null;
   let beTarget = null;
@@ -683,6 +687,7 @@ async function startSkillRuntime() {
     followingCamera = false;
     lpsTarget = pt ? { x: pt.x, y: pt.y, z: pt.z } : null;
     lps.setTarget(lpsTarget);
+    robotLps.setTarget(lpsTarget);
     marker.visible = !!lpsTarget;
     if (lpsTarget) marker.position.set(lpsTarget.x, lpsTarget.y, lpsTarget.z);
     lpsPanel.showTarget(lpsTarget);
@@ -693,6 +698,7 @@ async function startSkillRuntime() {
     followingCamera = true;
     lpsTarget = viewport.camera.position.clone();
     lps.setTarget(lpsTarget);          // skills see the camera position as of now
+    robotLps.setTarget(lpsTarget);
     marker.visible = false;
     lpsPanel.showTarget(null, 'Following viewport camera');
     applyAttention();
@@ -700,6 +706,7 @@ async function startSkillRuntime() {
   viewport.onFrame(() => {
     if (!followingCamera) return;
     lpsTarget.copy(viewport.camera.position);
+    robotLps.setTarget(lpsTarget);     // throttled to 10 Hz
     applyAttention();
   });
 

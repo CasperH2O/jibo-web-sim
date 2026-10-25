@@ -256,13 +256,40 @@ app.post('/__chatlog', express.json({ type: '*/*', limit: '64kb' }), (req, res) 
 //   GET /robot/status        -> hub /status (503 JSON when robot-os is not running)
 //   WS  /robot/expression    -> expression service RemoteClient socket
 //   WS  /robot/state, /lps   -> hub /state, /lps
+//   /robot/lps-service/<path> -> the skill runtime's jibo.lps client: HTTP (/lps/faces, ...)
+//                            goes to the simulated LPS service, WS (/lps/visual_awareness,
+//                            /lps/audible_awareness) to the hub's mirrors of its streams (the
+//                            service has one subscriber per stream: the attention manager)
 const ROBOT_OS_EXPRESSION_PORT = Number(process.env.ROBOT_OS_EXPRESSION_PORT) || 10015;
 const ROBOT_OS_HUB_PORT = Number(process.env.ROBOT_OS_HUB_PORT) || 8190;
+const ROBOT_OS_LPS_PORT = Number(process.env.ROBOT_OS_LPS_PORT) || 8484;
+const ROBOT_OS_LPS_PREFIX = '/robot/lps-service/';
 const ROBOT_OS_ROUTES = {
   '/robot/expression': `ws://127.0.0.1:${ROBOT_OS_EXPRESSION_PORT}/`,
   '/robot/state': `ws://127.0.0.1:${ROBOT_OS_HUB_PORT}/state`,
   '/robot/lps': `ws://127.0.0.1:${ROBOT_OS_HUB_PORT}/lps`,
 };
+function robotOsUpstream(pathname) {
+  if (ROBOT_OS_ROUTES[pathname]) return ROBOT_OS_ROUTES[pathname];
+  if (pathname.startsWith(ROBOT_OS_LPS_PREFIX)) return `ws://127.0.0.1:${ROBOT_OS_HUB_PORT}/${pathname.slice(ROBOT_OS_LPS_PREFIX.length)}`;
+  return null;
+}
+app.use(ROBOT_OS_LPS_PREFIX, express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
+  try {
+    const upstream = await fetch(`http://127.0.0.1:${ROBOT_OS_LPS_PORT}${req.url}`, {
+      method: req.method,
+      headers: req.headers['content-type'] ? { 'Content-Type': req.headers['content-type'] } : {},
+      body: ['GET', 'HEAD'].includes(req.method) || !Buffer.isBuffer(req.body) ? undefined : req.body,
+      signal: AbortSignal.timeout(5000),
+    });
+    res.status(upstream.status);
+    const type = upstream.headers.get('content-type');
+    if (type) res.set('Content-Type', type);
+    res.send(Buffer.from(await upstream.arrayBuffer()));
+  } catch (e) {
+    res.status(503).json({ ok: false, error: `robot-os LPS not reachable on 127.0.0.1:${ROBOT_OS_LPS_PORT} (${e.message})` });
+  }
+});
 app.get('/robot/status', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   try {
@@ -328,7 +355,7 @@ if (process.env.HTTPS === '1' || process.env.HTTPS_PORT) {
 // the X-JIBO-transID / X-JIBO-robotID headers on the upstream handshake.
 const wss = new WebSocketServer({ noServer: true });
 const onUpgrade = (req, sock, head) => {
-  const robotUpstream = req.url && ROBOT_OS_ROUTES[new URL(req.url, 'http://x').pathname];
+  const robotUpstream = req.url && robotOsUpstream(new URL(req.url, 'http://x').pathname);
   if (robotUpstream) { relayRobotOs(req, sock, head, robotUpstream); return; }
   if (!req.url || !req.url.startsWith('/__cloud-ws')) { sock.destroy(); return; }
   const u = new URL(req.url, 'http://x');

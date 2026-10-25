@@ -121,12 +121,19 @@ async function connectRobotOs() {
     const status = await res.json();
     if (!res.ok || !status.ok) throw new Error(status.error || `status ${res.status}`);
     const port = status.ports.expression;
+    const lpsPort = status.ports.lps;
     const wsBase = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}`;
-    window.__ROBOT_WS_ROUTES__ = { [`ws://127.0.0.1:${port}`]: `${wsBase}/robot/expression` };
+    // jibo.lps (the runtime's LPS client) reads robot-os's simulated LPS service: its
+    // awareness sockets and its HTTP endpoints go through the dev server's relay.
+    window.__ROBOT_WS_ROUTES__ = {
+      [`ws://127.0.0.1:${port}`]: `${wsBase}/robot/expression`,
+      [`ws://127.0.0.1:${lpsPort}`]: `${wsBase}/robot/lps-service`,
+    };
+    window.__ROBOT_HTTP_ROUTES__ = { [`http://127.0.0.1:${lpsPort}`]: '/robot/lps-service' };
     // The skill's directory on the robot-os machine, for expression.setSkillRoot.
     const skillRoot = status.skillsDir && dir.startsWith('/skills/') ? `${status.skillsDir}${dir.slice('/skills'.length)}` : null;
-    window.__ROBOT_OS__ = { expressionPort: port, skillUrl: dir, skillRoot };
-    console.log('[robot-os] backend active; expression service on port', port, 'skill root', skillRoot);
+    window.__ROBOT_OS__ = { expressionPort: port, lpsPort, skillUrl: dir, skillRoot };
+    console.log('[robot-os] backend active; expression service on port', port, 'LPS on port', lpsPort, 'skill root', skillRoot);
     return window.__ROBOT_OS__;
   } catch (e) {
     console.warn('[robot-os] not reachable, falling back to the local backend:', e.message);
@@ -215,7 +222,10 @@ async function bootReal() {
         // Connect the bundle's service clients to the in-memory service bus
         // (the in-browser stand-in for localhost services).
         try { if (!window.__serviceBus) window.__serviceBus = installServiceBus(req); } catch (e) { console.warn('[boot] service bus:', e.message); }
-        if (robotOs && window.__serviceBus) window.__serviceBus.external('expression', robotOs.expressionPort);
+        if (robotOs && window.__serviceBus) {
+          window.__serviceBus.external('expression', robotOs.expressionPort);
+          window.__serviceBus.external('lps', robotOs.lpsPort);
+        }
         // The service-records plugin is skipped under UNIT_TESTS, so jibo.records is empty
         // and clients have no host:port. Populate it from the bus so they connect to us.
         try { if (window.__serviceBus) v.records = window.__serviceBus.records(); } catch (e) { console.warn('[boot] records:', e.message); }

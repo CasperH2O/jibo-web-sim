@@ -95,8 +95,16 @@ export class ServiceBus {
     // 204 No Content so the bundle's `then`/`catch` paths see a clean
     // discard instead of repeated network errors.
     const blackholed = (url) => /^https?:\/\/(segment\.jibo\.com|api\.segment\.io)(\/|$)/i.test(String(url));
+    // External services (robot-os, see external()) are reached through the dev
+    // server's relay: window.__ROBOT_HTTP_ROUTES__ maps http://127.0.0.1:<port>
+    // to a same-origin path (boot.js).
+    const routed = (url) => {
+      const routes = window.__ROBOT_HTTP_ROUTES__;
+      const m = routes && /^(https?:\/\/[^/]+)(\/.*)?$/.exec(String(url));
+      return m && routes[m[1]] ? routes[m[1]] + (m[2] || '/') : url;
+    };
     function BusXHR() { this._real = new Real(); this._t = null; this._blackhole = false; this._ls = {}; this.readyState = 0; this.status = 0; this.responseText = ''; this.response = ''; this.responseType = ''; }
-    BusXHR.prototype.open = function (method, url, async) { this._method = method; this._async = async !== false; this._t = target(url); this._blackhole = !this._t && blackholed(url); if (!this._t && !this._blackhole) this._real.open(method, url, this._async); };
+    BusXHR.prototype.open = function (method, url, async) { this._method = method; this._async = async !== false; this._t = target(url); this._blackhole = !this._t && blackholed(url); if (!this._t && !this._blackhole) this._real.open(method, routed(url), this._async); };
     BusXHR.prototype.setRequestHeader = function (k, v) { if (!this._t && !this._blackhole) this._real.setRequestHeader(k, v); };
     BusXHR.prototype.getResponseHeader = function (k) { return (this._t || this._blackhole) ? null : this._real.getResponseHeader(k); };
     BusXHR.prototype.getAllResponseHeaders = function () { return (this._t || this._blackhole) ? '' : this._real.getAllResponseHeaders(); };

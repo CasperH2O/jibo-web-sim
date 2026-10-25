@@ -1066,10 +1066,15 @@ function makeFakeWs() {
   function WebSocket(url) {
     // Services that run in a real local process (robot-os) are reached
     // through the dev server's relay: window.__ROBOT_WS_ROUTES__ maps the
-    // client framework's hard-coded ws://127.0.0.1:<port> to it (boot.js).
+    // client framework's hard-coded ws://127.0.0.1:<port> to it (boot.js),
+    // keeping any path. Service clients also write "ws:127.0.0.1:<port>/..."
+    // without the slashes.
     const routes = (typeof window !== 'undefined' && window.__ROBOT_WS_ROUTES__) || null;
-    const routed = routes && routes[String(url).replace(/\/$/, '')];
-    if (routed) return realSocket(routed, { hub: false });
+    if (routes) {
+      const m = /^(wss?):\/*([^/]+)(\/.*)?$/.exec(String(url));
+      const routed = m && routes[`${m[1]}://${m[2]}`];
+      if (routed) return realSocket(routed + (m[3] && m[3] !== '/' ? m[3] : ''), { hub: false });
+    }
     const server = (typeof window !== 'undefined' && window.__JIBO_SERVER__) || '';
     // The cloud hub uses per-turn WS connections WITH custom upgrade
     // headers (X-JIBO-transID). Browsers can't set those, so the
