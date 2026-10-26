@@ -267,9 +267,18 @@ app.post('/__chatlog', express.json({ type: '*/*', limit: '64kb' }), (req, res) 
 //                            Independent of the backend choice; 503 when it is not running.
 //   WS  /robot/camera        -> robot-os's camera feed (robot-os/camera.mjs): the Camera tab's
 //                            webcam frames (binary JPEG) for Jibo's own LPS; stats come back
+//   /robot/media-service/<path> -> Jibo's own media service (ROBOT_OS_LPS=native; it runs in the
+//                            native LPS process): /media/photo, /media/photo/store,
+//                            /media/preview/control, ... for the skill runtime's jibo.media
+//   GET /robot/viewfinder    -> event stream of the camera preview the skill asked for: one
+//                            {enable, camera, window: {x, y, width, height}} per change, the
+//                            current one first. The media service has no display here, so
+//                            the relay takes what the skill posts to /media/preview/control
+//                            and the page draws the viewfinder.
 const ROBOT_OS_EXPRESSION_PORT = Number(process.env.ROBOT_OS_EXPRESSION_PORT) || 10015;
 const ROBOT_OS_HUB_PORT = Number(process.env.ROBOT_OS_HUB_PORT) || 8190;
 const ROBOT_OS_LPS_PORT = Number(process.env.ROBOT_OS_LPS_PORT) || 8484;
+const ROBOT_OS_MEDIA_PORT = Number(process.env.ROBOT_OS_MEDIA_PORT) || 8486;
 const ROBOT_OS_TTS_PORT = Number(process.env.ROBOT_OS_TTS_PORT) || 8189;
 const ROBOT_OS_CAMERA_PORT = Number(process.env.ROBOT_OS_CAMERA_PORT) || 8187;
 const ROBOT_BACKEND = process.env.ROBOT_BACKEND === 'robot-os' ? 'robot-os' : 'local';
@@ -288,21 +297,53 @@ function robotOsUpstream(pathname) {
   if (pathname.startsWith(ROBOT_OS_LPS_PREFIX)) return `ws://127.0.0.1:${ROBOT_OS_HUB_PORT}/${pathname.slice(ROBOT_OS_LPS_PREFIX.length)}`;
   return null;
 }
-app.use(ROBOT_OS_LPS_PREFIX, express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
-  try {
-    const upstream = await fetch(`http://127.0.0.1:${ROBOT_OS_LPS_PORT}${req.url}`, {
-      method: req.method,
-      headers: req.headers['content-type'] ? { 'Content-Type': req.headers['content-type'] } : {},
-      body: ['GET', 'HEAD'].includes(req.method) || !Buffer.isBuffer(req.body) ? undefined : req.body,
-      signal: AbortSignal.timeout(5000),
-    });
-    res.status(upstream.status);
-    const type = upstream.headers.get('content-type');
-    if (type) res.set('Content-Type', type);
-    res.send(Buffer.from(await upstream.arrayBuffer()));
-  } catch (e) {
-    res.status(503).json({ ok: false, error: `robot-os LPS not reachable on 127.0.0.1:${ROBOT_OS_LPS_PORT} (${e.message})` });
-  }
+// Plain HTTP relay to a robot-os service. `onSuccess(req)` runs after a 2xx answer.
+function relayHttp(prefix, port, name, { limit, timeoutMs, onSuccess }) {
+  app.use(prefix, express.raw({ type: '*/*', limit }), async (req, res) => {
+    try {
+      const upstream = await fetch(`http://127.0.0.1:${port}${req.url}`, {
+        method: req.method,
+        headers: req.headers['content-type'] ? { 'Content-Type': req.headers['content-type'] } : {},
+        body: ['GET', 'HEAD'].includes(req.method) || !Buffer.isBuffer(req.body) ? undefined : req.body,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      res.status(upstream.status);
+      const type = upstream.headers.get('content-type');
+      if (type) res.set('Content-Type', type);
+      res.send(Buffer.from(await upstream.arrayBuffer()));
+      if (upstream.ok && onSuccess) onSuccess(req);
+    } catch (e) {
+      res.status(503).json({ ok: false, error: `robot-os ${name} not reachable on 127.0.0.1:${port} (${e.message})` });
+    }
+  });
+}
+relayHttp(ROBOT_OS_LPS_PREFIX, ROBOT_OS_LPS_PORT, 'LPS', { limit: '1mb', timeoutMs: 5000 });
+// Photos travel as base64 JPEG in /media/photo/store.
+let viewfinder = { enable: false, camera: 1, window: { x: 0, y: 0, width: 1280, height: 720 } };
+const viewfinderClients = new Set();
+relayHttp('/robot/media-service/', ROBOT_OS_MEDIA_PORT, 'media service', {
+  limit: '32mb',
+  timeoutMs: 30000,
+  onSuccess(req) {
+    if (req.method !== 'POST' || !/^\/media\/preview\/control\/?(\?|$)/.test(req.url)) return;
+    let asked;
+    try { asked = JSON.parse(req.body.toString('utf8')); } catch (_) { return; }
+    if (!asked || typeof asked !== 'object') return;
+    const w = asked.window || {};
+    const num = (v, fallback) => (Number.isFinite(v) ? v : fallback);
+    viewfinder = {
+      enable: !!asked.enable,
+      camera: num(asked.camera, 1),
+      window: { x: num(w.x, 0), y: num(w.y, 0), width: num(w.width, 1280), height: num(w.height, 720) },
+    };
+    for (const client of viewfinderClients) client.write(`data: ${JSON.stringify(viewfinder)}\n\n`);
+  },
+});
+app.get('/robot/viewfinder', (req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
+  res.write(`data: ${JSON.stringify(viewfinder)}\n\n`);
+  viewfinderClients.add(res);
+  req.on('close', () => viewfinderClients.delete(res));
 });
 // Streamed both ways (speech audio arrives while it is being synthesised). A browser that
 // goes away mid-utterance closes the upstream request, which makes the bridge stop speaking.

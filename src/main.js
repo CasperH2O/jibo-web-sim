@@ -34,6 +34,7 @@ import { createWakeWord } from './skill-runtime/wake-word.js';
 import { createWebcam } from './camera/webcam.js';
 import { createCameraUplink } from './camera/uplink.js';
 import { createAwarenessReader } from './camera/awareness.js';
+import { createViewfinder } from './ui/viewfinder.js';
 
 // Skill bundles are discovered at boot by listing the /skills tree and
 // keeping every immediate subdirectory that has a package.json — the picker
@@ -315,6 +316,37 @@ async function startSkillRuntime() {
   iframe.style.pointerEvents = 'none';   // let OrbitControls own the viewport
   viewportEl.appendChild(iframe);
 
+  // The original bundle's camera viewfinder (jibo.media.setViewfinder), with Jibo's real
+  // media service (robot-os, ROBOT_OS_LPS=native): the dev server streams the preview the
+  // skill asked for, and the webcam is drawn on Jibo's screen above the face.
+  const viewfinder = createViewfinder({
+    viewportEl,
+    mesh: screenMesh,
+    camera: viewport.camera,
+    getStream: () => webcam.video.srcObject,
+  });
+  viewport.onFrame(viewfinder.update);
+  let viewfinderEvents = null;
+  const followViewfinder = (on) => {
+    if (!on) {
+      if (viewfinderEvents) viewfinderEvents.close();
+      viewfinderEvents = null;
+      viewfinder.set({ enable: false });
+      return;
+    }
+    if (viewfinderEvents) return;
+    viewfinderEvents = new EventSource('/robot/viewfinder');
+    viewfinderEvents.onmessage = (ev) => {
+      let state;
+      try { state = JSON.parse(ev.data); } catch (_) { return; }
+      const wasOn = viewfinder.isOn();
+      viewfinder.set(state);
+      if (state.enable && !wasOn && !webcam.isActive()) {
+        chat.addSystemMessage('\u{1F4F7} Jibo is showing the camera view, but the camera is off. Turn it on in the Camera tab.');
+      }
+    };
+  };
+
   // Real-runtime skills speak via SpeechSynthesis in THIS window — the
   // skill iframe is sandboxed so speech there is silent. The skill posts
   // {kind:'speak', id, text}; we utter it and post {kind:'speak-done', id} back
@@ -350,6 +382,7 @@ async function startSkillRuntime() {
     if (!nativeLps && webcam.isActive()) stopCamera();
     cameraPanel.setAvailable(nativeLps, on ? 'Needs robot-os with Jibo\'s real LPS (ROBOT_OS_LPS=native).' : undefined);
     if (nativeLps) setActiveTarget(null);
+    followViewfinder(nativeLps);
     lpsPanel.setEnabled(!nativeLps, 'Jibo\'s real LPS (robot-os) takes no placed targets: it sees the webcam (Camera tab)');
     if (!on) resumeLocalAttention();
   };
@@ -859,6 +892,13 @@ async function startSkillRuntime() {
       const server = getServer();
       const backend = await robotBackend;
       setRobotDrive(false);   // until the new iframe reports its backend
+      // A new skill starts without the old one's camera preview, which it can no longer
+      // turn off (also clears one left on before this page loaded).
+      if (backend === 'robot-os' && robotLpsMode === 'native') {
+        fetch('/robot/media-service/media/preview/control', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enable: false }),
+        }).catch(() => {});
+      }
       iframe.src = `/skill-host.html?dir=${encodeURIComponent(skill.dir)}&entry=${encodeURIComponent(skill.main)}${server ? `&server=${encodeURIComponent(server)}` : ''}${backend === 'robot-os' ? '&backend=robot-os' : ''}${voice === 'jibo' ? '&voice=jibo' : ''}`;
       if (skillPicker.value !== dir) skillPicker.value = dir;
     } catch (err) {

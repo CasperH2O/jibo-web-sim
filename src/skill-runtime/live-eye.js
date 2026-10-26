@@ -1248,18 +1248,29 @@ export function initOfflineServices(jibo, requireFn) {
   // server-side and replays the bytes back with permissive CORS, so the
   // image is no longer cross-origin from the browser's perspective and
   // texImage2D succeeds.
+  // Images served by a robot-os service (photos from Jibo's media service at
+  // http://127.0.0.1:<port>/media/photo?id=...) go through the dev server's relay
+  // instead, by window.__ROBOT_HTTP_ROUTES__ (boot.js), the same as their XHRs.
   try {
     const desc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
     if (desc && desc.set && !HTMLImageElement.prototype.__webProxied) {
       HTMLImageElement.prototype.__webProxied = true;
       const isCrossOrigin = (u) => /^https?:\/\//i.test(u) && new URL(u, location.href).origin !== location.origin;
+      const robotRoute = (u) => {
+        const routes = window.__ROBOT_HTTP_ROUTES__;
+        const m = routes && /^(https?:\/\/[^/]+)(\/.*)?$/.exec(u);
+        const base = m && routes[m[1].replace('//localhost:', '//127.0.0.1:')];
+        return base ? base + (m[2] || '/') : null;
+      };
       Object.defineProperty(HTMLImageElement.prototype, 'src', {
         configurable: true,
         get: desc.get,
         set(url) {
           try {
             const s = String(url == null ? '' : url);
-            if (isCrossOrigin(s)) {
+            const routed = robotRoute(s);
+            if (routed) url = routed;
+            else if (isCrossOrigin(s)) {
               url = `${location.origin}/__img?url=${encodeURIComponent(s)}`;
             }
           } catch (_) { /* leave url unchanged */ }

@@ -924,8 +924,14 @@ function makeHttpClient() {
       // was designed for Electron which doesn't enforce it). The proxy
       // strips that boundary.
       let url = directUrl;
+      // Services that run in a real local process (robot-os) go through the dev server's
+      // relay: window.__ROBOT_HTTP_ROUTES__ maps http://127.0.0.1:<port> to a same-origin
+      // path (boot.js). HTTPClient.postJSON (jibo.media.takePhoto, storePhoto) uses this.
+      const routes = (typeof window !== 'undefined' && window.__ROBOT_HTTP_ROUTES__) || null;
+      const routed = routes && upstreamPort && routes[`http://${upstreamHost === 'localhost' ? '127.0.0.1' : upstreamHost}:${upstreamPort}`];
+      if (routed) url = routed + (options.path || '/');
       const server = (typeof window !== 'undefined' && window.__JIBO_SERVER__) || '';
-      const isHub = server && upstreamHost === server;
+      const isHub = !routed && server && upstreamHost === server;
       // The cloud hub speaks the WS-only protocol at /listen and
       // /proactive. The jetstream client sends those as HTTP POSTs
       // (the way the on-device jetstream service exposes them to
@@ -958,6 +964,7 @@ function makeHttpClient() {
         const respHandlers = {};
         const resp = {
           statusCode: res.status,
+          statusMessage: res.statusText,
           headers: Object.fromEntries(res.headers.entries()),
           setEncoding() {},
           on(ev, h) { (respHandlers[ev] = respHandlers[ev] || []).push(h); if (ev === 'end' && respHandlers.data) setTimeout(flush, 0); return resp; },
