@@ -4,7 +4,8 @@
 // click-to-place in the 3D viewport. "Clear" removes the target. `onSetTarget`
 // receives a {x,y,z} world point (or null to clear); `onFollowCamera()` makes
 // Jibo track the viewport camera as it moves; `onPlacementMode(bool)` toggles
-// viewport click-to-place.
+// viewport click-to-place. `setEnabled(false, why)` greys the tab out (with
+// robot-os running Jibo's real LPS, which takes no placed targets).
 
 // Jibo's face sits at ~(0.03, 0.26, 0) facing +X; presets ring that point.
 const PRESETS = {
@@ -60,5 +61,15 @@ export function installLpsPanel(panelEl, { onSetTarget, onFollowCamera, onPlacem
     onPlacementMode(e.target.checked);
   });
 
-  return { showTarget };
+  const placeBox = panelEl.querySelector('#lps-place');
+  function setEnabled(on, why) {
+    for (const el of panelEl.querySelectorAll('button, input')) el.disabled = !on;
+    if (!on && placeBox.checked) {
+      placeBox.checked = false;
+      onPlacementMode(false);
+    }
+    showTarget(null, on ? undefined : why);
+  }
+
+  return { showTarget, setEnabled };
 }

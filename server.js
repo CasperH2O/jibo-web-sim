@@ -265,10 +265,13 @@ app.post('/__chatlog', express.json({ type: '*/*', limit: '64kb' }), (req, res) 
 //   /robot/tts/<path>        -> robot-os's TTS bridge (Jibo's real voice, robot-os/tts.mjs):
 //                            /status, /tts_speak (streamed audio/L16), /tts_token_times, ...
 //                            Independent of the backend choice; 503 when it is not running.
+//   WS  /robot/camera        -> robot-os's camera feed (robot-os/camera.mjs): the Camera tab's
+//                            webcam frames (binary JPEG) for Jibo's own LPS; stats come back
 const ROBOT_OS_EXPRESSION_PORT = Number(process.env.ROBOT_OS_EXPRESSION_PORT) || 10015;
 const ROBOT_OS_HUB_PORT = Number(process.env.ROBOT_OS_HUB_PORT) || 8190;
 const ROBOT_OS_LPS_PORT = Number(process.env.ROBOT_OS_LPS_PORT) || 8484;
 const ROBOT_OS_TTS_PORT = Number(process.env.ROBOT_OS_TTS_PORT) || 8189;
+const ROBOT_OS_CAMERA_PORT = Number(process.env.ROBOT_OS_CAMERA_PORT) || 8187;
 const ROBOT_BACKEND = process.env.ROBOT_BACKEND === 'robot-os' ? 'robot-os' : 'local';
 if (process.env.ROBOT_BACKEND && process.env.ROBOT_BACKEND !== ROBOT_BACKEND) {
   console.warn(`ROBOT_BACKEND must be 'local' or 'robot-os' (got '${process.env.ROBOT_BACKEND}'); using local`);
@@ -278,6 +281,7 @@ const ROBOT_OS_ROUTES = {
   '/robot/expression': `ws://127.0.0.1:${ROBOT_OS_EXPRESSION_PORT}/`,
   '/robot/state': `ws://127.0.0.1:${ROBOT_OS_HUB_PORT}/state`,
   '/robot/lps': `ws://127.0.0.1:${ROBOT_OS_HUB_PORT}/lps`,
+  '/robot/camera': `ws://127.0.0.1:${ROBOT_OS_CAMERA_PORT}/frames`,
 };
 function robotOsUpstream(pathname) {
   if (ROBOT_OS_ROUTES[pathname]) return ROBOT_OS_ROUTES[pathname];

@@ -13,6 +13,7 @@ import { installRigPanel } from './ui/rig-panel.js';
 import { installChatPanel } from './ui/chat-panel.js';
 import { installTtsPanel } from './ui/tts-panel.js';
 import { installLpsPanel } from './ui/lps-panel.js';
+import { installCameraPanel } from './ui/camera-panel.js';
 import { installAudioPanel } from './ui/audio-panel.js';
 import { installNotificationsPanel } from './ui/notifications-panel.js';
 import { createNotificationBanner } from './ui/notification-banner.js';
@@ -30,6 +31,9 @@ import { createNotificationsService } from './bridge/services/notifications-serv
 import { createMediaService } from './bridge/services/media-service.js';
 import { loadSkillManifest } from './skill-runtime/skill-loader.js';
 import { createWakeWord } from './skill-runtime/wake-word.js';
+import { createWebcam } from './camera/webcam.js';
+import { createCameraUplink } from './camera/uplink.js';
+import { createAwarenessReader } from './camera/awareness.js';
 
 // Skill bundles are discovered at boot by listing the /skills tree and
 // keeping every immediate subdirectory that has a package.json — the picker
@@ -93,6 +97,48 @@ const lpsPanel = installLpsPanel(panelsEl.querySelector('[data-panel="lps"]'), {
   onFollowCamera: () => followCamera(),
   onPlacementMode: (on) => viewport.setPlacement(on ? (pt) => setActiveTarget(pt) : null),
 });
+
+// Camera tab (robot-os with Jibo's real LPS only, ROBOT_OS_LPS=native): the webcam's
+// frames go to robot-os, where Jibo's own LPS tracks people in them and the real
+// attention manager turns the head. The real LPS takes no placed targets, so in that
+// mode the LPS tab is off; with robot-os's simulated LPS it is the other way round.
+// setRobotDrive (below) applies this once the skill iframe reports its backend.
+const webcam = createWebcam();
+let cameraPanel = null;
+const uplink = createCameraUplink({ video: webcam.video, onStatus: (s) => cameraPanel.showUplink(s) });
+const awareness = createAwarenessReader({ onFrame: (f) => cameraPanel.showAwareness(f) });
+let uplinkTicker = 0;
+async function startCamera(deviceId) {
+  if (!webcam.available()) throw new Error('No camera access in this page (it needs http://localhost or https://)');
+  try {
+    await webcam.start(deviceId);
+  } catch (e) {
+    stopCamera();
+    if (e && e.name === 'NotAllowedError') throw new Error('Camera permission was denied');
+    if (e && e.name === 'NotFoundError') throw new Error('No camera found');
+    throw e;
+  }
+  if (uplink.isActive()) return;
+  uplink.start();
+  awareness.start();
+  uplinkTicker = setInterval(() => cameraPanel.showUplink(uplink.status()), 1000);
+}
+function stopCamera() {
+  clearInterval(uplinkTicker);
+  uplink.stop();
+  awareness.stop();
+  webcam.stop();
+}
+cameraPanel = installCameraPanel(panelsEl.querySelector('[data-panel="camera"]'), {
+  video: webcam.video,
+  listDevices: webcam.listDevices,
+  onToggle: async (on) => {
+    if (!on) { stopCamera(); return null; }
+    await startCamera();
+    return webcam.currentDeviceId();
+  },
+  onDevice: (id) => startCamera(id || undefined),
+});
 installAudioPanel(panelsEl.querySelector('[data-panel="audio"]'), {
   onFire: (t) => fireAudioEvent(t),
   onPlacementMode: (on) => viewport.setPlacement(on ? (pt) => fireAudioEvent(pt) : null),
@@ -121,6 +167,7 @@ serverInput.addEventListener('change', () => {
 // server's default applies (/robot/config, local unless configured). Probed once; if
 // robot-os is not answering the page says so and stays on the local backend.
 const backendBadge = document.getElementById('backend-badge');
+let robotLpsMode = 'sim';   // robot-os's LPS: 'sim' (SSM's simulated one) or 'native' (Jibo's real one)
 const robotBackend = (async () => {
   let wanted = new URLSearchParams(location.search).get('backend');
   if (wanted !== 'local' && wanted !== 'robot-os') {
@@ -132,8 +179,9 @@ const robotBackend = (async () => {
     const res = await fetch('/robot/status', { cache: 'no-store' });
     const status = await res.json();
     if (!res.ok || !status.ok) throw new Error(status.error || `status ${res.status}`);
+    robotLpsMode = status.lps && status.lps.mode === 'native' ? 'native' : 'sim';
     backendBadge.textContent = 'robot-os';
-    backendBadge.title = `Real expression service (robot-os, Node ${status.node})`;
+    backendBadge.title = `Real expression service (robot-os, Node ${status.node}), ${robotLpsMode === 'native' ? 'Jibo\'s real LPS' : 'simulated LPS'}`;
     return 'robot-os';
   } catch (e) {
     console.warn('[robot-os] not reachable, using the local backend:', e.message);
@@ -298,6 +346,11 @@ async function startSkillRuntime() {
     if (on === robotState.active) return;
     if (on) { robotState.start(); robotLps.start(); } else { robotState.stop(); robotLps.stop(); }
     rigPanel.setExternallyDriven(on);
+    const nativeLps = on && robotLpsMode === 'native';
+    if (!nativeLps && webcam.isActive()) stopCamera();
+    cameraPanel.setAvailable(nativeLps, on ? 'Needs robot-os with Jibo\'s real LPS (ROBOT_OS_LPS=native).' : undefined);
+    if (nativeLps) setActiveTarget(null);
+    lpsPanel.setEnabled(!nativeLps, 'Jibo\'s real LPS (robot-os) takes no placed targets: it sees the webcam (Camera tab)');
     if (!on) resumeLocalAttention();
   };
   if (synth && synth.getVoices().length === 0 && typeof synth.addEventListener === 'function') {
