@@ -1075,11 +1075,12 @@ function makeFakeWs() {
     // through the dev server's relay: window.__ROBOT_WS_ROUTES__ maps the
     // client framework's hard-coded ws://127.0.0.1:<port> to it (boot.js),
     // keeping any path. Service clients also write "ws:127.0.0.1:<port>/..."
-    // without the slashes.
+    // without the slashes, and the client framework's WSClient takes the
+    // service's http:// URL (the KB's media list socket).
     const routes = (typeof window !== 'undefined' && window.__ROBOT_WS_ROUTES__) || null;
     if (routes) {
-      const m = /^(wss?):\/*([^/]+)(\/.*)?$/.exec(String(url));
-      const routed = m && routes[`${m[1]}://${m[2]}`];
+      const m = /^(wss?|https?):\/*([^/]+)(\/.*)?$/.exec(String(url));
+      const routed = m && routes[`${m[1].replace(/^http/, 'ws')}://${m[2]}`];
       if (routed) return realSocket(routed + (m[3] && m[3] !== '/' ? m[3] : ''), { hub: false });
     }
     const server = (typeof window !== 'undefined' && window.__JIBO_SERVER__) || '';

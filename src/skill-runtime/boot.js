@@ -124,21 +124,30 @@ async function connectRobotOs() {
     const lpsPort = status.ports.lps;
     // Only with Jibo's real LPS (ROBOT_OS_LPS=native), whose process also runs his media service.
     const mediaPort = status.ports.media || null;
+    // Jibo's real knowledge base and media manager (also `media-proxy`, kept photos).
+    const kbPort = status.ports.kb || null;
+    const mediaManagerPort = status.ports.mediaManager || null;
     const wsBase = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}`;
     // jibo.lps (the runtime's LPS client) reads robot-os's LPS service: its awareness
-    // sockets and its HTTP endpoints go through the dev server's relay. So does jibo.media
-    // (photos and the viewfinder), over HTTP only.
+    // sockets and its HTTP endpoints go through the dev server's relay. So do jibo.media
+    // (photos and the viewfinder), jibo.kb (HTTP, and a socket for media list changes) and
+    // the media manager.
     window.__ROBOT_WS_ROUTES__ = {
       [`ws://127.0.0.1:${port}`]: `${wsBase}/robot/expression`,
       [`ws://127.0.0.1:${lpsPort}`]: `${wsBase}/robot/lps-service`,
     };
     window.__ROBOT_HTTP_ROUTES__ = { [`http://127.0.0.1:${lpsPort}`]: '/robot/lps-service' };
     if (mediaPort) window.__ROBOT_HTTP_ROUTES__[`http://127.0.0.1:${mediaPort}`] = '/robot/media-service';
+    if (kbPort) {
+      window.__ROBOT_HTTP_ROUTES__[`http://127.0.0.1:${kbPort}`] = '/robot/kb-service';
+      window.__ROBOT_WS_ROUTES__[`ws://127.0.0.1:${kbPort}`] = `${wsBase}/robot/kb-service`;
+    }
+    if (mediaManagerPort) window.__ROBOT_HTTP_ROUTES__[`http://127.0.0.1:${mediaManagerPort}`] = '/robot/media-manager';
     // The skill's directory on the robot-os machine, for expression.setSkillRoot.
     const skillRoot = status.skillsDir && dir.startsWith('/skills/') ? `${status.skillsDir}${dir.slice('/skills'.length)}` : null;
-    window.__ROBOT_OS__ = { expressionPort: port, lpsPort, mediaPort, skillUrl: dir, skillRoot };
+    window.__ROBOT_OS__ = { expressionPort: port, lpsPort, mediaPort, kbPort, mediaManagerPort, skillUrl: dir, skillRoot };
     console.log('[robot-os] backend active; expression service on port', port, 'LPS on port', lpsPort,
-      mediaPort ? `media on port ${mediaPort}` : '(no media service)', 'skill root', skillRoot);
+      mediaPort ? `media on port ${mediaPort}` : '(no media service)', kbPort ? `KB on port ${kbPort}` : '(in-page KB)', 'skill root', skillRoot);
     return window.__ROBOT_OS__;
   } catch (e) {
     console.warn('[robot-os] not reachable, falling back to the local backend:', e.message);
@@ -231,11 +240,19 @@ async function bootReal() {
           window.__serviceBus.external('expression', robotOs.expressionPort);
           window.__serviceBus.external('lps', robotOs.lpsPort);
           if (robotOs.mediaPort) window.__serviceBus.external('media', robotOs.mediaPort);
+          if (robotOs.kbPort) window.__serviceBus.external('kb', robotOs.kbPort);
+          if (robotOs.mediaManagerPort) {
+            window.__serviceBus.external('media-manager', robotOs.mediaManagerPort);
+            window.__serviceBus.external('media-proxy', robotOs.mediaManagerPort);
+          }
         }
         // The service-records plugin is skipped under UNIT_TESTS, so jibo.records is empty
         // and clients have no host:port. Populate it from the bus so they connect to us.
         try { if (window.__serviceBus) v.records = window.__serviceBus.records(); } catch (e) { console.warn('[boot] records:', e.message); }
-        try { installKbService(req); } catch (e) { console.warn('[boot] kb service:', e.message); }
+        // With robot-os the whole KB is Jibo's real one; the in-page KB is for the local backend.
+        if (!(robotOs && robotOs.kbPort)) {
+          try { installKbService(req); } catch (e) { console.warn('[boot] kb service:', e.message); }
+        }
         if (eye) populateExpressionDofs(v, eye.robotInfo);
         installExpressionStubs(v, req);
         initOfflineServices(v, req);

@@ -270,6 +270,11 @@ app.post('/__chatlog', express.json({ type: '*/*', limit: '64kb' }), (req, res) 
 //   /robot/media-service/<path> -> Jibo's own media service (ROBOT_OS_LPS=native; it runs in the
 //                            native LPS process): /media/photo, /media/photo/store,
 //                            /media/preview/control, ... for the skill runtime's jibo.media
+//   /robot/kb-service/<path> -> Jibo's real knowledge base (KBService, ROBOT_OS_KB_PORT): the
+//                            skill runtime's whole jibo.kb in robot-os mode (/v1/kb/..., /v1/media/...);
+//                            WS /robot/kb-service is its socket (media list changes)
+//   /robot/media-manager/<path> -> Jibo's media manager (ROBOT_OS_MEDIA_MANAGER_PORT), also the
+//                            `media-proxy` record: kept photos at /proxy/media/photo/get?id=
 //   GET /robot/viewfinder    -> event stream of the camera preview the skill asked for: one
 //                            {enable, camera, window: {x, y, width, height}} per change, the
 //                            current one first. The media service has no display here, so
@@ -279,6 +284,8 @@ const ROBOT_OS_EXPRESSION_PORT = Number(process.env.ROBOT_OS_EXPRESSION_PORT) ||
 const ROBOT_OS_HUB_PORT = Number(process.env.ROBOT_OS_HUB_PORT) || 8190;
 const ROBOT_OS_LPS_PORT = Number(process.env.ROBOT_OS_LPS_PORT) || 8484;
 const ROBOT_OS_MEDIA_PORT = Number(process.env.ROBOT_OS_MEDIA_PORT) || 8486;
+const ROBOT_OS_KB_PORT = Number(process.env.ROBOT_OS_KB_PORT) || 8778;
+const ROBOT_OS_MEDIA_MANAGER_PORT = Number(process.env.ROBOT_OS_MEDIA_MANAGER_PORT) || 8488;
 const ROBOT_OS_TTS_PORT = Number(process.env.ROBOT_OS_TTS_PORT) || 8189;
 const ROBOT_OS_CAMERA_PORT = Number(process.env.ROBOT_OS_CAMERA_PORT) || 8187;
 const ROBOT_BACKEND = process.env.ROBOT_BACKEND === 'robot-os' ? 'robot-os' : 'local';
@@ -295,29 +302,41 @@ const ROBOT_OS_ROUTES = {
 function robotOsUpstream(pathname) {
   if (ROBOT_OS_ROUTES[pathname]) return ROBOT_OS_ROUTES[pathname];
   if (pathname.startsWith(ROBOT_OS_LPS_PREFIX)) return `ws://127.0.0.1:${ROBOT_OS_HUB_PORT}/${pathname.slice(ROBOT_OS_LPS_PREFIX.length)}`;
+  // The KB's socket (media list changes) is at its root.
+  if (pathname === '/robot/kb-service' || pathname === '/robot/kb-service/') return `ws://127.0.0.1:${ROBOT_OS_KB_PORT}/`;
   return null;
 }
-// Plain HTTP relay to a robot-os service. `onSuccess(req)` runs after a 2xx answer.
+// Plain HTTP relay to a robot-os service. `onSuccess(req)` runs after a 2xx answer. One
+// connection per request: Jibo's native services (Poco) close idle connections that a
+// keep-alive pool would then reuse, failing the next request.
 function relayHttp(prefix, port, name, { limit, timeoutMs, onSuccess }) {
-  app.use(prefix, express.raw({ type: '*/*', limit }), async (req, res) => {
-    try {
-      const upstream = await fetch(`http://127.0.0.1:${port}${req.url}`, {
-        method: req.method,
-        headers: req.headers['content-type'] ? { 'Content-Type': req.headers['content-type'] } : {},
-        body: ['GET', 'HEAD'].includes(req.method) || !Buffer.isBuffer(req.body) ? undefined : req.body,
-        signal: AbortSignal.timeout(timeoutMs),
+  app.use(prefix, express.raw({ type: '*/*', limit }), (req, res) => {
+    const body = ['GET', 'HEAD'].includes(req.method) || !Buffer.isBuffer(req.body) ? null : req.body;
+    const headers = req.headers['content-type'] ? { 'Content-Type': req.headers['content-type'] } : {};
+    if (body) headers['Content-Length'] = body.length;
+    const upstream = http.request({ host: '127.0.0.1', port, path: req.url, method: req.method, headers, agent: false, timeout: timeoutMs }, (up) => {
+      const chunks = [];
+      up.on('data', (chunk) => chunks.push(chunk));
+      up.on('end', () => {
+        res.status(up.statusCode);
+        if (up.headers['content-type']) res.set('Content-Type', up.headers['content-type']);
+        res.send(Buffer.concat(chunks));
+        if (up.statusCode >= 200 && up.statusCode < 300 && onSuccess) onSuccess(req);
       });
-      res.status(upstream.status);
-      const type = upstream.headers.get('content-type');
-      if (type) res.set('Content-Type', type);
-      res.send(Buffer.from(await upstream.arrayBuffer()));
-      if (upstream.ok && onSuccess) onSuccess(req);
-    } catch (e) {
-      res.status(503).json({ ok: false, error: `robot-os ${name} not reachable on 127.0.0.1:${port} (${e.message})` });
-    }
+      up.on('error', (e) => fail(e));
+    });
+    const fail = (e) => {
+      if (res.headersSent) return;
+      res.status(503).json({ ok: false, error: `robot-os ${name} not reachable on 127.0.0.1:${port} (${e.code || e.message})` });
+    };
+    upstream.on('timeout', () => upstream.destroy(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' })));
+    upstream.on('error', fail);
+    upstream.end(body || undefined);
   });
 }
 relayHttp(ROBOT_OS_LPS_PREFIX, ROBOT_OS_LPS_PORT, 'LPS', { limit: '1mb', timeoutMs: 5000 });
+relayHttp('/robot/kb-service/', ROBOT_OS_KB_PORT, 'KB', { limit: '32mb', timeoutMs: 30000 });
+relayHttp('/robot/media-manager/', ROBOT_OS_MEDIA_MANAGER_PORT, 'media manager', { limit: '32mb', timeoutMs: 30000 });
 // Photos travel as base64 JPEG in /media/photo/store.
 let viewfinder = { enable: false, camera: 1, window: { x: 0, y: 0, width: 1280, height: 720 } };
 const viewfinderClients = new Set();

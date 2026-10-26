@@ -1141,13 +1141,22 @@ export function initOfflineServices(jibo, requireFn) {
       else installProactiveStub();
     }
   } catch (e) { console.warn('[live-eye] action.init:', e.message); }
+  // The eye's asset cache ('global-eye') is created when the face renderer's EyeContainer
+  // initialises, which here comes after the skill starts loading. With a KB that answers at
+  // once (Jibo's real one, robot-os), @be/be preloads eye animations before that, and
+  // loading their textures into the missing cache throws. addCache is idempotent, so the
+  // EyeContainer finds it in place later.
+  try { if (jibo && jibo.loader && jibo.loader.addCache) jibo.loader.addCache('global-eye'); } catch (e) { console.warn('[live-eye] eye cache:', e.message); }
+
   // The KB loop is normally set up by the host (kb.init + kb.initLoop).
   // The runtime assumes jibo.kb.loop exists (e.g. analytics
   // listenForLoopChanges reads jibo.kb.loop.events). initLoop is
-  // connection-free.
+  // connection-free. The in-page KB needs no address; Jibo's real one
+  // (robot-os) is reached at its record, through the dev server's relay.
   try {
     if (jibo && jibo.kb) {
-      if (jibo.kb.init && !jibo.kb.httpUrl) jibo.kb.init({ host: '127.0.0.1', port: 0 }, () => {});
+      const kbRecord = window.__ROBOT_OS__ && window.__ROBOT_OS__.kbPort ? recordFor('kb') : null;
+      if (jibo.kb.init && !jibo.kb.httpUrl) jibo.kb.init(kbRecord || { host: '127.0.0.1', port: 0 }, () => {});
       if (jibo.kb.initLoop && !jibo.kb.loop) jibo.kb.initLoop();
     }
   } catch (e) { console.warn('[live-eye] kb init:', e.message); }
