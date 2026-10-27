@@ -169,6 +169,7 @@ serverInput.addEventListener('change', () => {
 // robot-os is not answering the page says so and stays on the local backend.
 const backendBadge = document.getElementById('backend-badge');
 let robotLpsMode = 'sim';   // robot-os's LPS: 'sim' (SSM's simulated one) or 'native' (Jibo's real one)
+let robotCloud;             // robot-os's photo cloud (Phoenix's address), null without one
 const robotBackend = (async () => {
   let wanted = new URLSearchParams(location.search).get('backend');
   if (wanted !== 'local' && wanted !== 'robot-os') {
@@ -181,6 +182,7 @@ const robotBackend = (async () => {
     const status = await res.json();
     if (!res.ok || !status.ok) throw new Error(status.error || `status ${res.status}`);
     robotLpsMode = status.lps && status.lps.mode === 'native' ? 'native' : 'sim';
+    robotCloud = status.cloud;
     backendBadge.textContent = 'robot-os';
     backendBadge.title = `Real expression service (robot-os, Node ${status.node}), ${robotLpsMode === 'native' ? 'Jibo\'s real LPS' : 'simulated LPS'}`;
     return 'robot-os';
@@ -374,6 +376,7 @@ async function startSkillRuntime() {
   const robotLps = createRobotLpsLink({ rig: viewport.rig });
   viewport.onFrame(robotState.update);
   let resumeLocalAttention = () => {};   // assigned once the look-at solver exists
+  let cloudWarned = false;
   const setRobotDrive = (on) => {
     if (on === robotState.active) return;
     if (on) { robotState.start(); robotLps.start(); } else { robotState.stop(); robotLps.stop(); }
@@ -383,6 +386,14 @@ async function startSkillRuntime() {
     cameraPanel.setAvailable(nativeLps, on ? 'Needs robot-os with Jibo\'s real LPS (ROBOT_OS_LPS=native).' : undefined);
     if (nativeLps) setActiveTarget(null);
     followViewfinder(nativeLps);
+    // Kept photos only stay in Jibo's gallery with a photo cloud (Phoenix); say so where
+    // photos are taken, and once in Chat.
+    const noCloud = nativeLps && robotCloud === null;
+    cameraPanel.showCloud(noCloud ? 'Photos you keep will not stay in Jibo\'s gallery: robot-os has no photo cloud. Run scripts/setup-robot-os-cloud once, then restart robot-os.' : null);
+    if (noCloud && !cloudWarned) {
+      cloudWarned = true;
+      chat.addSystemMessage('\u{1F4F7} robot-os has no photo cloud, so photos Jibo keeps will not stay in the gallery. Run scripts/setup-robot-os-cloud once, then restart robot-os.');
+    }
     lpsPanel.setEnabled(!nativeLps, 'Jibo\'s real LPS (robot-os) takes no placed targets: it sees the webcam (Camera tab)');
     if (!on) resumeLocalAttention();
   };

@@ -25,6 +25,7 @@ export function installCameraPanel(panelEl, { video, onToggle, onDevice, listDev
         <span></span>
       </div>
       <p class="rig-note" id="cam-note">Needs the robot-os backend.</p>
+      <p class="rig-note" id="cam-cloud" hidden></p>
     </section>
     <section class="rig-section">
       <div class="cam-preview" id="cam-preview" hidden>
@@ -38,6 +39,7 @@ export function installCameraPanel(panelEl, { video, onToggle, onDevice, listDev
   const onBox = panelEl.querySelector('#cam-on');
   const deviceSel = panelEl.querySelector('#cam-device');
   const note = panelEl.querySelector('#cam-note');
+  const cloudNote = panelEl.querySelector('#cam-cloud');
   const preview = panelEl.querySelector('#cam-preview');
   const overlay = panelEl.querySelector('#cam-overlay');
   const readout = panelEl.querySelector('#cam-readout');
@@ -141,6 +143,11 @@ export function installCameraPanel(panelEl, { video, onToggle, onDevice, listDev
         showOff();
         readout.textContent = 'Camera off';
       }
+    },
+    // A note about where kept photos go (robot-os's photo cloud); null hides it.
+    showCloud(text) {
+      cloudNote.textContent = text || '';
+      cloudNote.hidden = !text;
     },
     // Uplink status (camera/uplink.js), called whenever it changes and about once a second.
     showUplink(s) {
