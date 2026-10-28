@@ -24,6 +24,7 @@ export function createViewfinder({ viewportEl, mesh, camera, getStream }) {
   viewportEl.appendChild(el);
   const overlay = createFaceOverlay({ viewportEl, element: el, mesh, camera });
   let on = false;
+  let rect = { x: 0, y: 0, width: 1280, height: 720 };
 
   // Follow the webcam being switched on/off (or to another device) while shown.
   function syncStream() {
@@ -41,7 +42,7 @@ export function createViewfinder({ viewportEl, mesh, camera, getStream }) {
       video.srcObject = null;
       return;
     }
-    const r = win || { x: 0, y: 0, width: 1280, height: 720 };
+    const r = rect = win || { x: 0, y: 0, width: 1280, height: 720 };
     Object.assign(video.style, { left: `${r.x}px`, top: `${r.y}px`, width: `${r.width}px`, height: `${r.height}px` });
     el.style.display = '';
     syncStream();
@@ -53,5 +54,25 @@ export function createViewfinder({ viewportEl, mesh, camera, getStream }) {
     overlay.update();
   }
 
-  return { set, update, isOn: () => on };
+  // The same picture on a flat canvas (the screen dock): `k` is canvas pixels per face pixel.
+  // The <video> and its CSS live outside the skill iframe, so the dock can't copy them.
+  function paint(ctx, k) {
+    if (!on) return;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(rect.x * k, rect.y * k, rect.width * k, rect.height * k);
+    ctx.clip();
+    ctx.fillStyle = '#000';
+    ctx.fillRect(rect.x * k, rect.y * k, rect.width * k, rect.height * k);
+    if (video.readyState >= 2 && video.videoWidth) {
+      const f = Math.max(rect.width / video.videoWidth, rect.height / video.videoHeight);   // object-fit: cover
+      const w = video.videoWidth * f * k, h = video.videoHeight * f * k;
+      ctx.translate((rect.x + rect.width / 2) * k, (rect.y + rect.height / 2) * k);
+      ctx.scale(-1, 1);                                                                      // mirrored
+      ctx.drawImage(video, -w / 2, -h / 2, w, h);
+    }
+    ctx.restore();
+  }
+
+  return { set, update, paint, isOn: () => on };
 }
