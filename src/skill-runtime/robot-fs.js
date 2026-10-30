@@ -66,6 +66,7 @@ function statsOf(info) {
   const mtime = new Date(info.mtimeMs || 0);
   return {
     size: info.size || 0, mode: info.mode || 0, mtime, mtimeMs: info.mtimeMs || 0, ctime: mtime, atime: mtime, birthtime: mtime,
+    nlink: info.nlink || 1, ino: info.ino || 0, uid: info.uid || 0, gid: info.gid || 0, dev: 0,
     isFile: () => info.type === 'file', isDirectory: () => info.type === 'dir', isSymbolicLink: () => false,
   };
 }

@@ -219,15 +219,19 @@ async function bootReal() {
   window.__JIBO_ELECTRON__ = true;     // the runtime builds its render path under electron
   // The robot's own file system (robot-fs.js), when the dev server has one: before the
   // bundle's first require, which may already read or create robot paths.
+  // Its host processes' ports (host-process.js) are reached through the server's /__host relay.
+  let hostRoutes = {};
   try {
     const config = await (await fetch('/robot/config', { cache: 'no-store' })).json();
     window.__ROBOT_FS__ = config.robotFs === true;
-  } catch (_) { window.__ROBOT_FS__ = false; }
+    for (const port of config.hostPorts || []) hostRoutes[`http://127.0.0.1:${port}`] = `/__host/${port}`;
+  } catch (_) { window.__ROBOT_FS__ = false; hostRoutes = {}; }
   const req = createRequire(null)(dir); // require('jibo') -> the bundle's real runtime
   commonGlobals(req);
   window.process = req('process');
   window.process.env.RUNMODE = 'UNIT_TESTS';   // robot-service plugins skip cleanly offline
   const robotOs = await connectRobotOs();
+  window.__ROBOT_HTTP_ROUTES__ = Object.assign({}, window.__ROBOT_HTTP_ROUTES__, hostRoutes);
   reportBackend();
 
   // Preload the eye config so we can fill in what the (absent) expression service

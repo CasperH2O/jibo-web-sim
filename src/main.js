@@ -312,7 +312,9 @@ async function startSkillRuntime() {
   // The skill's face surface: a sandboxed iframe, projected onto the screen.
   const iframe = document.createElement('iframe');
   iframe.id = 'skill-iframe';
-  iframe.allow = 'microphone';   // voice turns: the hub-bridge captures mic inside the iframe
+  // microphone: voice turns (the hub-bridge captures the mic inside the iframe); autoplay: the
+  // Start Jibo click lets the skill play media with sound (BEam's music and video players).
+  iframe.allow = 'microphone; autoplay';
   // allow-same-origin lets the iframe load its ES modules from our dev server;
   // the shim only ever talks to the host via postMessage, so the isolation
   // contract still holds and a true cross-origin host is a drop-in later, except for the

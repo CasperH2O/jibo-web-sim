@@ -1295,6 +1295,33 @@ export function initOfflineServices(jibo, requireFn) {
       });
     }
   } catch (e) { console.warn('[live-eye] image proxy patch:', e.message); }
+  // Audio and video (BEam's music player streams from its helper on 127.0.0.1:18701) and the
+  // bundle's own fetches take the same relays.
+  try {
+    const routed = (u) => {
+      const routes = window.__ROBOT_HTTP_ROUTES__;
+      const m = routes && /^(https?:\/\/[^/]+)(\/.*)?$/.exec(String(u == null ? '' : u));
+      const base = m && routes[m[1].replace('//localhost:', '//127.0.0.1:')];
+      return base ? base + (m[2] || '/') : null;
+    };
+    const media = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+    if (media && media.set && !HTMLMediaElement.prototype.__robotRouted) {
+      HTMLMediaElement.prototype.__robotRouted = true;
+      Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+        configurable: true,
+        get: media.get,
+        set(url) { media.set.call(this, routed(url) || url); },
+      });
+    }
+    if (!window.fetch.__robotRouted) {
+      const nativeFetch = window.fetch;
+      window.fetch = function (input, init) {
+        const target = typeof input === 'string' || input instanceof URL ? routed(String(input)) : null;
+        return nativeFetch.call(this, target || input, init);
+      };
+      window.fetch.__robotRouted = true;
+    }
+  } catch (e) { console.warn('[live-eye] media/fetch relay patch:', e.message); }
 
   // Lifecycle.finished crashes under UNIT_TESTS: its init returns
   // early without creating `this._client`, and every phase-end

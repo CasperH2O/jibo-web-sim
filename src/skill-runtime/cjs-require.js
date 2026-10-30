@@ -17,6 +17,7 @@
 // like the real thing.
 
 import { robotPath, robotFsUrl, robotFs } from './robot-fs.js';
+import { makeChildProcess } from './host-process.js';
 
 // Native XHR captured up-front so our internal sync requests (module loading, fs)
 // keep working even after the service layer swaps window.XMLHttpRequest to route
@@ -1021,7 +1022,8 @@ function makeHttpClient() {
   function request(options, cb) {
     const reqHandlers = {};
     const body = [];
-    const upstreamHost = options.host || options.hostname || '';
+    // url.parse() results carry the port in `host` too ('127.0.0.1:18701'): prefer hostname.
+    const upstreamHost = options.hostname || String(options.host || '').replace(/:\d+$/, '');
     const upstreamPort = options.port || '';
     const directUrl = `http${options.protocol === 'https:' ? 's' : ''}://${upstreamHost}${upstreamPort ? ':' + upstreamPort : ''}${options.path || '/'}`;
     const method = (options.method || 'GET').toUpperCase();
@@ -1057,6 +1059,9 @@ function makeHttpClient() {
         init.headers['X-Cloud-Upstream'] = `${upstreamHost}${upstreamPort ? ':' + upstreamPort : ''}`;
       }
       if (method !== 'GET' && method !== 'HEAD' && body.length) init.body = body.join('');
+      // A host process (/__host/<port>, e.g. BEam's music helper) answers like Node: a
+      // 'response' event and Buffer chunks as they arrive (its media streams are long).
+      if (typeof routed === 'string' && routed.startsWith('/__host/')) { streamHost(url, init); return; }
       fetch(url, init).then(async (res) => {
         let text = await res.text();
         // Hub responses use msgID/transID; the jetstream client
@@ -1078,6 +1083,7 @@ function makeHttpClient() {
           statusMessage: res.statusText,
           headers: Object.fromEntries(res.headers.entries()),
           setEncoding() {},
+          destroy() {}, resume() {}, pause() {},
           on(ev, h) { (respHandlers[ev] = respHandlers[ev] || []).push(h); if (ev === 'end' && respHandlers.data) setTimeout(flush, 0); return resp; },
           once(ev, h) { return resp.on(ev, h); },
         };
@@ -1093,16 +1099,66 @@ function makeHttpClient() {
         (reqHandlers.error || []).forEach((h) => { try { h(err); } catch (_) {} });
       });
     }
+    let cancelStream = null;
+    function streamHost(url, init) {
+      const controller = new AbortController();
+      const emit = (handlers, ev, ...a) => (handlers[ev] || []).slice().forEach((h) => { try { h(...a); } catch (_) { /* listener threw */ } });
+      fetch(url, Object.assign(init, { signal: controller.signal })).then((res) => {
+        const respHandlers = {};
+        let paused = false; let wake = null; let done = false;
+        const resp = {
+          statusCode: res.status,
+          statusMessage: res.statusText,
+          headers: Object.fromEntries(res.headers.entries()),
+          setEncoding() {},
+          pause() { paused = true; return resp; },
+          resume() { paused = false; if (wake) { wake(); wake = null; } return resp; },
+          destroy() { if (!done) { done = true; controller.abort(); } },
+          on(ev, h) { (respHandlers[ev] = respHandlers[ev] || []).push(h); return resp; },
+          once(ev, h) { const g = (...a) => { resp.removeListener(ev, g); h(...a); }; return resp.on(ev, g); },
+          removeListener(ev, h) { const l = respHandlers[ev] || []; const i = l.indexOf(h); if (i >= 0) l.splice(i, 1); return resp; },
+        };
+        cancelStream = () => resp.destroy();
+        if (cb) cb(resp);
+        emit(reqHandlers, 'response', resp);
+        const reader = res.body.getReader();
+        const pump = async () => {
+          for (;;) {
+            if (paused) await new Promise((r) => { wake = r; });
+            const { value, done: end } = await reader.read();
+            if (end) break;
+            emit(respHandlers, 'data', window.Buffer.from(value));
+          }
+          done = true;
+          emit(respHandlers, 'end');
+        };
+        setTimeout(() => pump().catch((err) => {
+          if (done) return;
+          done = true;
+          emit(respHandlers, 'aborted');
+          emit(respHandlers, 'error', err);
+        }), 0);
+      }).catch((err) => emit(reqHandlers, 'error', err));
+    }
     const req = {
       on(ev, h) { (reqHandlers[ev] = reqHandlers[ev] || []).push(h); return req; },
       once(ev, h) { return req.on(ev, h); },
       write(data) { if (data != null) body.push(typeof data === 'string' ? data : String(data)); return req; },
       end(data) { if (data != null) body.push(typeof data === 'string' ? data : String(data)); go(); return req; },
-      abort() {}, destroy() {}, setTimeout() { return req; }, setHeader(k, v) { (options.headers = options.headers || {})[k] = v; }, flushHeaders() {},
+      abort() { if (cancelStream) cancelStream(); }, destroy() { if (cancelStream) cancelStream(); }, setTimeout() { return req; }, setHeader(k, v) { (options.headers = options.headers || {})[k] = v; }, flushHeaders() {},
     };
     return req;
   }
-  return { request, get(options, cb) { const r = request(typeof options === 'string' ? { method: 'GET', path: options } : options, cb); r.end(); return r; } };
+  // A URL string (or URL) becomes Node's options, the way http.get('http://h:p/x') reads it;
+  // a bare path stays a path.
+  const optionsOf = (target) => {
+    if (target instanceof URL || (typeof target === 'string' && /^https?:\/\//i.test(target))) {
+      const u = new URL(String(target));
+      return { method: 'GET', protocol: u.protocol, hostname: u.hostname, port: u.port, path: u.pathname + u.search };
+    }
+    return typeof target === 'string' ? { method: 'GET', path: target } : target;
+  };
+  return { request, get(options, cb) { const r = request(optionsOf(options), cb); r.end(); return r; } };
 }
 
 // In-memory replacement for the `ws` package. Clients connect silently
@@ -1240,6 +1296,12 @@ function makeFakeWs() {
 }
 
 function makeBuiltins() {
+  function randomBytes(n, cb) {
+    const bytes = Buffer.alloc(n);
+    for (let i = 0; i < n; i += 65536) crypto.getRandomValues(bytes.subarray(i, Math.min(n, i + 65536)));
+    if (typeof cb === 'function') { setTimeout(() => cb(null, bytes), 0); return undefined; }
+    return bytes;
+  }
   // Function-style so it works as both `new EventEmitter()` and the legacy
   // `EventEmitter.call(this)` (pixi.js / node 'events' style).
   function EventEmitter() { if (!this._e) this._e = {}; }
@@ -1279,13 +1341,21 @@ function makeBuiltins() {
     return _td ? _td.decode(sub) : String.fromCharCode.apply(null, Array.from(sub));
   }
   function _wrap(u8) { u8.toString = function (enc, s, e) { return _decode(this, enc, s, e); }; return u8; }
-  function Buffer(arg) {
+  function Buffer(arg, encoding) {
     if (typeof arg === 'number') return _wrap(new Uint8Array(arg));
-    if (typeof arg === 'string') return _wrap(_te ? _te.encode(arg) : Uint8Array.from(arg, (c) => c.charCodeAt(0) & 0xff));
+    if (typeof arg === 'string') {
+      if (encoding === 'base64') return _wrap(Uint8Array.from(atob(arg.replace(/[^A-Za-z0-9+/]/g, '')), (c) => c.charCodeAt(0)));
+      if (encoding === 'hex') return _wrap(Uint8Array.from(arg.match(/[0-9a-f]{2}/gi) || [], (h) => parseInt(h, 16)));
+      if (encoding === 'latin1' || encoding === 'binary') return _wrap(Uint8Array.from(arg, (c) => c.charCodeAt(0) & 0xff));
+      return _wrap(_te ? _te.encode(arg) : Uint8Array.from(arg, (c) => c.charCodeAt(0) & 0xff));
+    }
     if (arg instanceof Uint8Array || Array.isArray(arg)) return _wrap(Uint8Array.from(arg));
+    // fetch bodies and other binary views (Node's Buffer.from takes them too)
+    if (arg instanceof ArrayBuffer) return _wrap(new Uint8Array(arg.slice(0)));
+    if (ArrayBuffer.isView(arg)) return _wrap(new Uint8Array(arg.buffer.slice(arg.byteOffset, arg.byteOffset + arg.byteLength)));
     return _wrap(new Uint8Array(0));
   }
-  Buffer.from = (x) => Buffer(x);
+  Buffer.from = (x, encoding) => Buffer(x, encoding);
   Buffer.alloc = (n) => _wrap(new Uint8Array(n));
   Buffer.allocUnsafe = (n) => _wrap(new Uint8Array(n));
   Buffer.isBuffer = (x) => x instanceof Uint8Array;
@@ -1377,7 +1447,8 @@ function makeBuiltins() {
     stream,
     buffer: { Buffer },
     string_decoder: { StringDecoder: class { write(x) { return String(x); } end() { return ''; } } },
-    crypto: { randomBytes: (n) => Buffer.alloc(n), createHash: () => ({ update() { return this; }, digest: () => '' }), createHmac: () => ({ update() { return this; }, digest: () => '' }) },
+    // randomBytes is really random: BEam makes tokens and file names with it.
+    crypto: { randomBytes, createHash: () => ({ update() { return this; }, digest: () => '' }), createHmac: () => ({ update() { return this; }, digest: () => '' }) },
     url: makeUrl(),
     querystring: { parse: (s) => Object.fromEntries(new URLSearchParams(s)), stringify: (o) => new URLSearchParams(o).toString(), escape: (s) => encodeURIComponent(String(s)), unescape: (s) => decodeURIComponent(String(s)) },
     // No local servers exist, so HTTP requests must FAIL FAST (emit 'error') rather
@@ -1415,7 +1486,13 @@ function makeBuiltins() {
       };
     })(),
     domain: { create: () => ({ run: (f) => f(), on() {}, add() {}, enter() {}, exit() {}, dispose() {} }) },
-    child_process: {}, cluster: {}, readline: {}, timers: { setTimeout, clearTimeout, setInterval, clearInterval, setImmediate: (f) => setTimeout(f, 0) },
+    // spawn runs on the host through the dev server (host-process.js), with a robot file system.
+    child_process: makeChildProcess(EventEmitter), cluster: {}, readline: {},
+    // Bound to the window: called as timers.setTimeout() the browser's own throw "Illegal invocation".
+    timers: {
+      setTimeout: (...a) => setTimeout(...a), clearTimeout: (t) => clearTimeout(t),
+      setInterval: (...a) => setInterval(...a), clearInterval: (t) => clearInterval(t), setImmediate: (f, ...a) => setTimeout(f, 0, ...a),
+    },
     constants: {}, module: { Module: {} },
   };
 }

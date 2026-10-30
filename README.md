@@ -101,6 +101,27 @@ never creates `/opt/jibo/Jibo` (BEam would then act as if it runs on a
 robot, with OTA updates), and drops a public 5x1.com `endpoint` from
 `/var/jibo/credentials.json`.
 
+### Host processes
+
+Some bundles start processes of their own: BEam's music skill starts its
+player's helper, a Node server on `127.0.0.1:18701`. With a robot file
+system, the page's `child_process.spawn` asks the server to run it on the
+host over the `/__host-process` socket. Only Node may run, only a script
+inside the skill bundles, and only with a few memory flags. The process is
+preloaded with `scripts/robot-host.cjs`, which maps the robot paths onto
+`ROBOT_FS_DIR` and keeps its servers on 127.0.0.1. It ends when the page
+does. `HOST_RELAY_PORTS` lists the ports the page may reach through
+`/__host/<port>/`: the page's `http`, `fetch` and `<audio>`/`<video>`
+requests to `http://127.0.0.1:<port>` go there.
+
+```sh
+ROBOT_FS_DIR=/path/to/robot-fs HOST_RELAY_PORTS=18701 node server.js
+```
+
+The same preload runs BEam's control panel on its own, on the same robot
+file system: `node --require ./scripts/robot-host.cjs
+<bundle>/beacon/server.js 8123`.
+
 ## What you supply
 
 The simulator ships **no skill content of its own**. You bring:

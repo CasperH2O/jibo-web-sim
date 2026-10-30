@@ -6,7 +6,7 @@ import http from 'node:http';
 import https from 'node:https';
 import crypto from 'node:crypto';
 import os from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { WebSocketServer, WebSocket as WS } from 'ws';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize } from 'node:path';
@@ -439,7 +439,10 @@ app.get('/__robotfs/stat', (req, res) => {
   if (!target) { robotFsFail(res, { code: 'ENOENT', message: 'not a robot path' }); return; }
   try {
     const st = statSync(target.host);
-    res.json({ type: st.isDirectory() ? 'dir' : st.isFile() ? 'file' : 'other', size: st.size, mtimeMs: st.mtimeMs, mode: st.mode });
+    res.json({
+      type: st.isDirectory() ? 'dir' : st.isFile() ? 'file' : 'other',
+      size: st.size, mtimeMs: st.mtimeMs, mode: st.mode, nlink: st.nlink, ino: st.ino, uid: st.uid, gid: st.gid,
+    });
   } catch (e) { robotFsFail(res, e); }
 });
 app.get('/__robotfs/readdir', (req, res) => {
@@ -493,9 +496,102 @@ if (ROBOT_FS_DIR) {
   for (const root of ROBOT_FS_ROOTS) mkdirSync(join(ROBOT_FS_DIR, root), { recursive: true });
 }
 
+// Host processes for a bundle that starts its own (BEam's music skill spawns its player
+// helper, a Node server on 127.0.0.1:18701). A browser cannot, so the page's
+// child_process.spawn asks this server over the /__host-process socket (robot-fs.js and
+// cjs-require.js); see onUpgrade below. Only with a robot file system, and only Node running
+// a script inside the skill bundles, preloaded with scripts/robot-host.cjs so its robot
+// paths land in ROBOT_FS_DIR like the page's. The process ends with the socket (the page
+// unloads): its stdin closes first, as its lease, then SIGTERM.
+// HOST_RELAY_PORTS lists the 127.0.0.1 ports the page may reach through /__host/<port>/
+// (the helper's API and media); /robot/config tells the page which.
+const HOST_RELAY_PORTS = String(process.env.HOST_RELAY_PORTS || '').split(/[\s,]+/).filter(Boolean).map(Number)
+  .filter((n) => Number.isInteger(n) && n > 0 && n < 65536);
+const ROBOT_HOST_PRELOAD = join(__dirname, 'scripts', 'robot-host.cjs');
+const HOST_NODE_FLAGS = /^--(max-old-space-size=\d+|expose-gc|no-warnings|no-deprecation)$/;
+
+// hostPath('/skills/x/y') -> '<EXTERNAL_SKILLS>/x/y'; robot paths -> ROBOT_FS_DIR; else null.
+function hostPath(pagePath) {
+  const p = normalize(String(pagePath || ''));
+  if (p.startsWith('/skills/')) {
+    const abs = normalize(join(EXTERNAL_SKILLS, p.slice('/skills/'.length)));
+    return abs.startsWith(`${normalize(EXTERNAL_SKILLS)}/`) ? abs : null;
+  }
+  const robot = robotFsPath(p);
+  return robot && p.startsWith('/') ? robot.host : null;
+}
+function spawnHostProcess(msg) {
+  if (!ROBOT_FS_DIR) throw Object.assign(new Error('no robot file system (ROBOT_FS_DIR)'), { code: 'ENOSYS' });
+  if (!/(^|\/)node$/.test(String(msg.command || ''))) throw Object.assign(new Error(`only node may run here, not ${msg.command}`), { code: 'EACCES' });
+  const args = Array.isArray(msg.args) ? msg.args.map(String) : [];
+  const first = args.findIndex((a) => !a.startsWith('-'));
+  if (first < 0 || args.slice(0, first).some((a) => !HOST_NODE_FLAGS.test(a))) {
+    throw Object.assign(new Error(`unsupported node arguments: ${args.join(' ')}`), { code: 'EACCES' });
+  }
+  const script = hostPath(args[first]);
+  if (!script || !args[first].startsWith('/skills/') || !existsSync(script)) {
+    throw Object.assign(new Error(`not a script in the skill bundles: ${args[first]}`), { code: 'ENOENT' });
+  }
+  // The bundle's environment, with its robot and bundle paths turned into host paths.
+  const env = { PATH: process.env.PATH, ROBOT_FS_DIR, ROBOT_HOST_LOOPBACK: '1' };
+  for (const [k, v] of Object.entries(msg.env || {})) {
+    if (k === 'PATH' || k === 'ROBOT_FS_DIR' || k === 'NODE_OPTIONS') continue;
+    env[k] = hostPath(v) || String(v);
+  }
+  const cwd = (msg.cwd && hostPath(msg.cwd)) || dirname(script);
+  const child = spawn(process.execPath, ['--require', ROBOT_HOST_PRELOAD, ...args.slice(0, first), script, ...args.slice(first + 1)],
+    { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  console.log(`[host-process] started ${args[first]} (pid ${child.pid})`);
+  return child;
+}
+const hostProcessWss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+function bridgeHostProcess(req, sock, head) {
+  hostProcessWss.handleUpgrade(req, sock, head, (ws) => {
+    let child = null;
+    const send = (obj) => { try { ws.send(JSON.stringify(obj)); } catch (_) { /* page gone */ } };
+    ws.on('message', (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString('utf8')); } catch (_) { return; }
+      if (msg.type === 'spawn' && !child) {
+        try { child = spawnHostProcess(msg); } catch (e) { send({ type: 'error', code: e.code || 'EIO', message: e.message }); return; }
+        send({ type: 'spawned', pid: child.pid });
+        child.stdout.on('data', (b) => send({ type: 'stdout', data: b.toString('base64') }));
+        child.stderr.on('data', (b) => send({ type: 'stderr', data: b.toString('base64') }));
+        child.stdin.on('error', () => {});
+        child.on('error', (e) => send({ type: 'error', code: e.code || 'EIO', message: e.message }));
+        child.on('exit', (code, signal) => { send({ type: 'exit', code, signal }); console.log(`[host-process] pid ${child.pid} exited (${signal || code})`); });
+      } else if (child && msg.type === 'stdin') child.stdin.write(Buffer.from(String(msg.data || ''), 'base64'));
+      else if (child && msg.type === 'stdin-end') child.stdin.end();
+      else if (child && msg.type === 'kill') { try { child.kill(msg.signal || 'SIGTERM'); } catch (_) { /* gone */ } }
+    });
+    ws.on('close', () => {
+      if (!child || child.exitCode !== null || child.signalCode !== null) return;
+      try { child.stdin.end(); } catch (_) { /* closed */ }
+      const c = child;
+      setTimeout(() => { if (c.exitCode === null && c.signalCode === null) c.kill('SIGTERM'); }, 2000);
+    });
+  });
+}
+// The page's requests to a host process's port, streamed both ways (media ranges included).
+app.all(/^\/__host\/(\d+)(\/.*)?$/, (req, res) => {
+  const port = Number(req.params[0]);
+  if (!HOST_RELAY_PORTS.includes(port)) { res.status(404).end(); return; }
+  const path = (req.params[1] || '/') + (req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '');
+  const headers = { ...req.headers, host: `127.0.0.1:${port}` };
+  delete headers.origin; delete headers.referer;
+  const upstream = http.request({ host: '127.0.0.1', port, path, method: req.method, headers, agent: false }, (up) => {
+    res.status(up.statusCode || 502);
+    for (const [k, v] of Object.entries(up.headers)) { if (k !== 'connection' && k !== 'transfer-encoding') res.setHeader(k, v); }
+    up.pipe(res);
+  });
+  upstream.on('error', (e) => { if (!res.headersSent) res.status(502).type('text/plain').send(`host process on port ${port}: ${e.message}`); else res.end(); });
+  res.on('close', () => { if (!res.writableFinished) upstream.destroy(); });
+  req.pipe(upstream);
+});
+
 app.get('/robot/config', (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json({ defaultBackend: ROBOT_BACKEND, robotFs: Boolean(ROBOT_FS_DIR) });
+  res.json({ defaultBackend: ROBOT_BACKEND, robotFs: Boolean(ROBOT_FS_DIR), hostPorts: ROBOT_FS_DIR ? HOST_RELAY_PORTS : [] });
 });
 app.get('/robot/status', async (req, res) => {
   res.set('Cache-Control', 'no-store');
@@ -564,6 +660,7 @@ const wss = new WebSocketServer({ noServer: true });
 const onUpgrade = (req, sock, head) => {
   const robotUpstream = req.url && robotOsUpstream(new URL(req.url, 'http://x').pathname);
   if (robotUpstream) { relayRobotOs(req, sock, head, robotUpstream); return; }
+  if (req.url && new URL(req.url, 'http://x').pathname === '/__host-process') { bridgeHostProcess(req, sock, head); return; }
   if (!req.url || !req.url.startsWith('/__cloud-ws')) { sock.destroy(); return; }
   const u = new URL(req.url, 'http://x');
   const upstream = u.searchParams.get('upstream');
