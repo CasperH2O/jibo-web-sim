@@ -656,6 +656,33 @@ if (process.env.HTTPS === '1' || process.env.HTTPS_PORT) {
 //   ws://<sim>/__cloud-ws?upstream=<host>:<port>&path=<p>&transID=<id>[&robotID=<r>]
 // and the server upgrades both sides and pipes frames between them, injecting
 // the X-JIBO-transID / X-JIBO-robotID headers on the upstream handshake.
+// CLOUD_AUDIO=ogg-opus: the cloud takes the robot's own microphone format (BEefy, the BE
+// family's cloud: Ogg/Opus, one complete Ogg page per message), so the page's 16 kHz 16-bit
+// PCM is encoded by ffmpeg on the way. The default, pcm, passes it as it is (Phoenix).
+const CLOUD_AUDIO = process.env.CLOUD_AUDIO === 'ogg-opus' ? 'ogg-opus' : 'pcm';
+function oggOpusEncoder(onPage) {
+  const ff = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', '16000', '-ac', '1', '-i', 'pipe:0',
+    '-c:a', 'libopus', '-b:a', '32k', '-application', 'voip', '-frame_duration', '20',
+    '-page_duration', '20000', '-flush_packets', '1', '-f', 'ogg', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
+  let pending = Buffer.alloc(0);
+  // Split ffmpeg's output into whole pages: 27-byte header, segment table, segments.
+  ff.stdout.on('data', (chunk) => {
+    pending = Buffer.concat([pending, chunk]);
+    while (pending.length >= 27 && pending.toString('latin1', 0, 4) === 'OggS') {
+      const segments = pending[26];
+      if (pending.length < 27 + segments) return;
+      let size = 27 + segments;
+      for (let i = 0; i < segments; i += 1) size += pending[27 + i];
+      if (pending.length < size) return;
+      onPage(Buffer.from(pending.subarray(0, size)));
+      pending = pending.subarray(size);
+    }
+  });
+  ff.on('error', (e) => console.warn('[cloud-ws] ffmpeg:', e.message));
+  ff.stdin.on('error', () => {});
+  return { write: (pcm) => ff.stdin.write(pcm), close: () => { try { ff.stdin.end(); } catch (_) { /* gone */ } } };
+}
+
 const wss = new WebSocketServer({ noServer: true });
 const onUpgrade = (req, sock, head) => {
   const robotUpstream = req.url && robotOsUpstream(new URL(req.url, 'http://x').pathname);
@@ -686,11 +713,17 @@ const onUpgrade = (req, sock, head) => {
     // string, binary as Buffer.
     const relay = (sink, data, isBinary) => { try { sink.send(isBinary ? data : data.toString('utf8'), { binary: !!isBinary }); } catch (_) { /* sink closed */ } };
     const pending = [];
-    clientWS.on('message', (data, isBinary) => { if (opened) relay(upstreamWS, data, isBinary); else pending.push([data, isBinary]); });
+    const toCloud = (data, isBinary) => { if (opened) relay(upstreamWS, data, isBinary); else pending.push([data, isBinary]); };
+    let encoder = null;
+    clientWS.on('message', (data, isBinary) => {
+      if (!isBinary || CLOUD_AUDIO === 'pcm') { toCloud(data, isBinary); return; }
+      if (!encoder) encoder = oggOpusEncoder((page) => toCloud(page, true));
+      encoder.write(data);
+    });
     upstreamWS.on('open', () => { for (const [d, b] of pending) relay(upstreamWS, d, b); pending.length = 0; });
     upstreamWS.on('message', (data, isBinary) => relay(clientWS, data, isBinary));
-    upstreamWS.on('close', cleanup);
-    clientWS.on('close', cleanup);
+    upstreamWS.on('close', () => { if (encoder) encoder.close(); cleanup(); });
+    clientWS.on('close', () => { if (encoder) encoder.close(); cleanup(); });
     upstreamWS.on('error', (e) => { try { clientWS.send(JSON.stringify({ type: 'ERROR', data: { message: 'upstream WS error: ' + e.message } })); } catch (_) {} cleanup(); });
     clientWS.on('error', cleanup);
   });
