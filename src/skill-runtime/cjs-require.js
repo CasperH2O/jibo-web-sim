@@ -728,9 +728,11 @@ function _buildHubMessages(path, body, transID) {
     // and breaks news. Provide a current release so the mediator
     // stays out of the way and the IR decision (report-skill) stands.
     const generalRelease = (typeof window !== 'undefined' && window.__JIBO_RELEASE__) || '1.9.0';
+    // No CONTEXT.data.skill: there is no active cloud skill. Leave the field out rather than
+    // null; Phoenix treats both alike, BEefy fails on a null one.
     const msgs = [
       { type: 'LISTEN', msgID: mid(), ts, data },
-      { type: 'CONTEXT', msgID: mid(), ts, data: { general: { release: generalRelease }, runtime: _runtime, skill: null } },
+      { type: 'CONTEXT', msgID: mid(), ts, data: { general: { release: generalRelease }, runtime: _runtime } },
     ];
     if (body.clientNLU != null) {
       // NLUResult shape: { rules, intent, entities }. The jetstream
