@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize } from 'node:path';
 import {
   appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync,
-  statSync, unlinkSync, writeFileSync,
+  realpathSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 
 // Cloud hub auth: the hub accepts a Bearer JWT signed with HS256. The secret
@@ -52,6 +52,14 @@ app.use((req, res, next) => {
 // show up in the picker; the demos already shipped in ./skills work the
 // same way. Override via EXTERNAL_SKILLS if you want to point elsewhere.
 const EXTERNAL_SKILLS = process.env.EXTERNAL_SKILLS || join(__dirname, 'skills');
+// BEacon reads the release marker beside the BEam checkout, outside the bundle.
+app.get('/__be-release', (req, res) => {
+  try {
+    const be = realpathSync(join(EXTERNAL_SKILLS, 'jibo-be'));
+    const marker = join(be, '..', '..', 'jibo-tbd', 'package.json');
+    res.json({ version: JSON.parse(readFileSync(marker, 'utf8')).version });
+  } catch (_) { res.status(404).end(); }
+});
 // Optional launch-rule pack — a separate tree of launch.rule + .grm files
 // the NLU registry picks up in addition to anything the loaded bundle
 // ships. Defaults to ./rules (gitignored, empty by default) so users can
@@ -529,7 +537,17 @@ function spawnHostProcess(msg) {
     throw Object.assign(new Error(`unsupported node arguments: ${args.join(' ')}`), { code: 'EACCES' });
   }
   const script = hostPath(args[first]);
-  if (!script || !args[first].startsWith('/skills/') || !existsSync(script)) {
+  const custom = /^\/tmp\/beam-beacon\/skills\/packages\/[a-f0-9]{24}\/.+\.js$/.test(args[first]);
+  let allowedCustom = false;
+  if (script && custom) {
+    try {
+      const packageDir = args[first].match(/^\/tmp\/beam-beacon\/skills\/packages\/[a-f0-9]{24}/)[0];
+      const root = realpathSync(hostPath(packageDir));
+      const packages = realpathSync(hostPath('/tmp/beam-beacon/skills/packages'));
+      allowedCustom = root.startsWith(`${packages}/`) && realpathSync(script).startsWith(`${root}/`);
+    } catch (_) { /* missing or invalid package */ }
+  }
+  if (!script || (!args[first].startsWith('/skills/') && !allowedCustom) || !existsSync(script)) {
     throw Object.assign(new Error(`not a script in the skill bundles: ${args[first]}`), { code: 'ENOENT' });
   }
   // The bundle's environment, with its robot and bundle paths turned into host paths.
@@ -553,7 +571,7 @@ function bridgeHostProcess(req, sock, head) {
       let msg;
       try { msg = JSON.parse(data.toString('utf8')); } catch (_) { return; }
       if (msg.type === 'spawn' && !child) {
-        try { child = spawnHostProcess(msg); } catch (e) { send({ type: 'error', code: e.code || 'EIO', message: e.message }); return; }
+        try { child = spawnHostProcess(msg); } catch (e) { console.warn(`[host-process] ${e.message}`); send({ type: 'error', code: e.code || 'EIO', message: e.message }); return; }
         send({ type: 'spawned', pid: child.pid });
         child.stdout.on('data', (b) => send({ type: 'stdout', data: b.toString('base64') }));
         child.stderr.on('data', (b) => send({ type: 'stderr', data: b.toString('base64') }));

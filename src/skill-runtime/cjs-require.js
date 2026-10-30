@@ -89,6 +89,9 @@ export function createRequire(jibo) {
   // Collapse `/./` (and trailing `/.`) before the lookup, or real files get
   // wrongly flagged missing and never fetched (radio's defaultStations.json).
   const normPath = (u) => String(u).split('?')[0].replace(/\/\.(?=\/)/g, '').replace(/\/\.$/, '');
+  // BEacon installs revisioned custom packages on the simulated robot filesystem.
+  // Do not treat arbitrary robot data as executable modules.
+  const customModulePath = (u) => robotPath(u) && /^\/tmp\/beam-beacon\/skills\/packages\/[a-f0-9]{24}\//.test(u);
   // When a manifest is loaded, ANY path is decidable: under skillRoot we check
   // the manifest, OUTSIDE skillRoot it's guaranteed missing (we only serve the
   // bundle's own tree). This also kills the require-walk's higher node_modules/
@@ -106,6 +109,9 @@ export function createRequire(jibo) {
   // so the bundle takes the same fallback path silently.
   const isAbsentAbsolute = (u) => /^\/(opt|var|etc|root|home|usr|sys|proc|tmp|\.jibo|src(\/|$))/.test(String(u));
   function fetchTextSync(url) {
+    if (customModulePath(url)) {
+      try { return new TextDecoder().decode(robotFs.read(url)); } catch (_) { return null; }
+    }
     if (url in textCache) return textCache[url];
     // Don't even request files the manifest says aren't there (avoids 404 noise).
     if (knownMissing(url) || isAbsentAbsolute(url)) { textCache[url] = null; return null; }
@@ -164,9 +170,15 @@ export function createRequire(jibo) {
       const candidate = join(dir, `node_modules/${request}`);
       const r = resolveFile(candidate) || resolveDir(candidate);
       if (r) return r;
-      if (dir === '/' || dir === '') return null;
+      if (dir === '/' || dir === '') break;
       dir = dirname(dir);
     }
+    // Custom packages live outside BEam's tree but share its host dependencies.
+    if (customModulePath(fromDir + '/') && skillRoot) {
+      const candidate = join(skillRoot, `node_modules/${request}`);
+      return resolveFile(candidate) || resolveDir(candidate);
+    }
+    return null;
   }
 
   // The runtime's PathUtils.resolve() uses node's Module internals to
@@ -381,6 +393,7 @@ function makeHttpFs() {
       }
       p = out.join('/') || '/';
     }
+    if (p === '/jibo-tbd/package.json' && window.__SKILL_DIR__ === '/skills/jibo-be') return '/__be-release';
     const root = (typeof window !== 'undefined' && window.__SKILL_DIR__) || '';
     const i = p.lastIndexOf('/node_modules/');
     if (i >= 0) return rewriteAnimTexture(root + p.slice(i));
