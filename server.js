@@ -10,7 +10,10 @@ import { execFileSync } from 'node:child_process';
 import { WebSocketServer, WebSocket as WS } from 'ws';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize } from 'node:path';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import {
+  appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync,
+  statSync, unlinkSync, writeFileSync,
+} from 'node:fs';
 
 // Cloud hub auth: the hub accepts a Bearer JWT signed with HS256. The secret
 // and credential identifiers are fully configurable via env vars — any
@@ -85,11 +88,12 @@ app.get(/webgl-texture-util\.js$/, (req, res, next) => {
 // resolved relative to the *playing skill's* assetPack root, so each
 // consuming skill needs the same redirect.
 //
-// Match any of the affected skill paths and probe the shared database copy.
+// Match any of the affected skill paths (1.9.2: node_modules/@be/<skill>, BEam:
+// jibo-be/skills/<skill>) and probe the shared database copy.
 // The capture is greedy on the subpath because the textures are organized
 // in subdirectories — not just leaf filenames.
-app.get(/\/@be\/[^/]+\/animations\/textures\/(.+)$/, (req, res, next) => {
-  const m = /\/@be\/[^/]+\/animations\/textures\/(.+)$/.exec(req.path);
+app.get(/\/(?:@be|jibo-be\/skills)\/[^/]+\/animations\/textures\/(.+)$/, (req, res, next) => {
+  const m = /\/(?:@be|jibo-be\/skills)\/[^/]+\/animations\/textures\/(.+)$/.exec(req.path);
   if (!m) { next(); return; }
   const subpath = m[1];
   const fallback = `/skills/jibo-be/node_modules/jibo-anim-db-animations/animations/textures/${subpath}`;
@@ -386,9 +390,112 @@ app.use('/robot/tts/', (req, res) => {
   res.on('close', () => { if (!res.writableFinished) upstream.destroy(); });
   req.pipe(upstream);
 });
+// The robot's own file system, for bundles that keep their state there (BEam: its settings,
+// BEacon's data, the jukebox library and thumbnails). With ROBOT_FS_DIR set, the robot paths
+// below map onto that host directory, and the page's fs shim reads and writes them through
+// /__robotfs (src/skill-runtime/robot-fs.js). Without it the page treats them as absent.
+// /opt/jibo/Jibo (the robot's Skills tree) is never created: BEam takes it to mean it runs
+// on a robot, and would then offer OTA updates and system controls.
+const ROBOT_FS_DIR = process.env.ROBOT_FS_DIR ? normalize(process.env.ROBOT_FS_DIR) : '';
+const ROBOT_FS_ROOTS = ['/opt/jibo', '/var/jibo', '/opt/tmp', '/tmp'];
+const ROBOT_FS_DENIED = ['/opt/jibo/Jibo'];
+// The robot's cloud credentials. BEam's defaults name the public BE cloud (5x1.com); this
+// robot's cloud is the local one, so such an endpoint is dropped when the file is written.
+const ROBOT_FS_CREDENTIALS = '/var/jibo/credentials.json';
+
+// robotFsPath('/opt/jibo/x') -> { robot, host }, or null outside the robot roots.
+function robotFsPath(robotPath) {
+  const robot = normalize(`/${robotPath || ''}`).replace(/\/+$/, '') || '/';
+  if (!ROBOT_FS_ROOTS.some((r) => robot === r || robot.startsWith(`${r}/`))) return null;
+  return { robot, host: join(ROBOT_FS_DIR, robot) };
+}
+// A failed call answers 200 with the error's code: a missing file is a normal answer to the
+// fs shim, and an HTTP error status would be logged in the browser console every time.
+// Report robot paths, not where they live on the host.
+function robotFsFail(res, e) {
+  const message = String(e.message || '').split(ROBOT_FS_DIR).join('');
+  res.json({ code: e.code || 'EIO', message });
+}
+function robotFsDenied(robot) {
+  return ROBOT_FS_DENIED.some((d) => robot === d || robot.startsWith(`${d}/`));
+}
+function robotFsGuardCredentials(target) {
+  if (target.robot !== ROBOT_FS_CREDENTIALS || !existsSync(target.host)) return;
+  try {
+    const creds = JSON.parse(readFileSync(target.host, 'utf8'));
+    if (creds && typeof creds.endpoint === 'string' && /(^|[/.])5x1\.com([:/]|$)/i.test(creds.endpoint)) {
+      console.log(`[robot-fs] ${ROBOT_FS_CREDENTIALS}: dropped the public endpoint ${creds.endpoint}`);
+      delete creds.endpoint;
+      writeFileSync(target.host, `${JSON.stringify(creds, null, 2)}\n`);
+    }
+  } catch (_) { /* not JSON (yet): nothing to guard */ }
+}
+app.use('/__robotfs', (req, res, next) => {
+  if (!ROBOT_FS_DIR) { res.status(404).json({ code: 'ENOSYS', message: 'no robot file system (ROBOT_FS_DIR)' }); return; }
+  next();
+});
+app.get('/__robotfs/stat', (req, res) => {
+  const target = robotFsPath(req.query.path);
+  if (!target) { robotFsFail(res, { code: 'ENOENT', message: 'not a robot path' }); return; }
+  try {
+    const st = statSync(target.host);
+    res.json({ type: st.isDirectory() ? 'dir' : st.isFile() ? 'file' : 'other', size: st.size, mtimeMs: st.mtimeMs, mode: st.mode });
+  } catch (e) { robotFsFail(res, e); }
+});
+app.get('/__robotfs/readdir', (req, res) => {
+  const target = robotFsPath(req.query.path);
+  if (!target) { robotFsFail(res, { code: 'ENOENT', message: 'not a robot path' }); return; }
+  try { res.json({ names: readdirSync(target.host) }); } catch (e) { robotFsFail(res, e); }
+});
+app.get(/^\/__robotfs\/file(\/.*)$/, (req, res) => {
+  const target = robotFsPath(decodeURIComponent(req.params[0]));
+  if (!target) { res.status(404).end(); return; }
+  // Served files keep real HTTP statuses: <img> and fetch read them directly.
+  res.sendFile(target.host, { dotfiles: 'allow' }, (e) => { if (e && !res.headersSent) res.status(404).end(); });
+});
+app.put(/^\/__robotfs\/file(\/.*)$/, express.raw({ type: () => true, limit: '64mb' }), (req, res) => {
+  const target = robotFsPath(decodeURIComponent(req.params[0]));
+  if (!target || robotFsDenied(target.robot)) { robotFsFail(res, { code: 'EACCES', message: 'not writable' }); return; }
+  const flag = ['w', 'wx', 'a'].includes(req.query.flag) ? req.query.flag : 'w';
+  try {
+    writeFileSync(target.host, Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0), { flag });
+    robotFsGuardCredentials(target);
+    res.status(204).end();
+  } catch (e) { robotFsFail(res, e); }
+});
+app.post('/__robotfs/op', (req, res) => {
+  const { op } = req.query;
+  const target = robotFsPath(req.query.path);
+  const to = req.query.to === undefined ? null : robotFsPath(req.query.to);
+  if (!target || (req.query.to !== undefined && !to)) { robotFsFail(res, { code: 'EACCES', message: 'not a robot path' }); return; }
+  if (robotFsDenied(target.robot) || (to && robotFsDenied(to.robot))) { robotFsFail(res, { code: 'EACCES', message: 'not writable' }); return; }
+  try {
+    if (op === 'mkdir') mkdirSync(target.host, { recursive: req.query.recursive === '1' });
+    else if (op === 'rmdir') rmdirSync(target.host);
+    else if (op === 'unlink') unlinkSync(target.host);
+    else if (op === 'rm') rmSync(target.host, { recursive: req.query.recursive === '1', force: req.query.force === '1' });
+    else if (op === 'rename' && to) renameSync(target.host, to.host);
+    else if (op === 'copy' && to) copyFileSync(target.host, to.host);
+    // A hard link is a copy here; like link(2) it fails when the target exists.
+    else if (op === 'link' && to) {
+      if (existsSync(to.host)) throw Object.assign(new Error(`file already exists, link '${to.robot}'`), { code: 'EEXIST' });
+      copyFileSync(target.host, to.host);
+    } else if (op === 'chmod') {
+      // Keep the files usable by this server: owner read/write (and search) always stay.
+      const mode = parseInt(req.query.mode, 8) || 0;
+      chmodSync(target.host, mode | (statSync(target.host).isDirectory() ? 0o700 : 0o600));
+    } else { robotFsFail(res, { code: 'EINVAL', message: `unknown op '${op}'` }); return; }
+    if (to) robotFsGuardCredentials(to);
+    res.status(204).end();
+  } catch (e) { robotFsFail(res, e); }
+});
+if (ROBOT_FS_DIR) {
+  for (const root of ROBOT_FS_ROOTS) mkdirSync(join(ROBOT_FS_DIR, root), { recursive: true });
+}
+
 app.get('/robot/config', (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json({ defaultBackend: ROBOT_BACKEND });
+  res.json({ defaultBackend: ROBOT_BACKEND, robotFs: Boolean(ROBOT_FS_DIR) });
 });
 app.get('/robot/status', async (req, res) => {
   res.set('Cache-Control', 'no-store');

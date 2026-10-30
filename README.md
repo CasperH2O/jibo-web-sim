@@ -81,7 +81,25 @@ node server.js
 
 Either tree is walked the same way as a bundle — any `launch.rule` files
 under `<root>/node_modules/<scope>/<name>/` register as that skill, and any
-`*.grm` files register as factory grammars.
+`*.grm` files register as factory grammars. A bundle's own skills root
+(BEam's `@be/be/skills/<name>/launch.rule`) registers as `@be/<name>`.
+
+### The robot's file system
+
+Bundles that keep state on the robot (BEam: its settings, BEacon's data,
+the jukebox library) need somewhere to write it. With `ROBOT_FS_DIR` set,
+the robot paths `/opt/jibo`, `/var/jibo`, `/opt/tmp` and `/tmp` map onto
+that host directory: the page's `fs` reads and writes them through the
+server's `/__robotfs` API, and `file://` images under them load from it.
+
+```sh
+ROBOT_FS_DIR=/path/to/robot-fs node server.js
+```
+
+Without it those paths stay absent, as on any other bundle. The server
+never creates `/opt/jibo/Jibo` (BEam would then act as if it runs on a
+robot, with OTA updates), and drops a public 5x1.com `endpoint` from
+`/var/jibo/credentials.json`.
 
 ## What you supply
 

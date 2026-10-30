@@ -12,6 +12,7 @@
 //     so it renders instead of staying blank.
 
 import { DOFArbiter } from './dof-arbiter.js';
+import { robotPath, robotFsUrl } from './robot-fs.js';
 
 // Singleton — initialized in installExpressionStubs once robotInfo is available
 // (we need the DOF universe to seed OwnershipInformation entries). All animation
@@ -1260,6 +1261,8 @@ export function initOfflineServices(jibo, requireFn) {
   // Images served by a robot-os service (photos from Jibo's media service at
   // http://127.0.0.1:<port>/media/photo?id=...) go through the dev server's relay
   // instead, by window.__ROBOT_HTTP_ROUTES__ (boot.js), the same as their XHRs.
+  // file:// images (BEam's jukebox covers) load from the robot file system when they are
+  // robot paths, and otherwise from the same path on the dev server (the bundle's files).
   try {
     const desc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
     if (desc && desc.set && !HTMLImageElement.prototype.__webProxied) {
@@ -1279,6 +1282,10 @@ export function initOfflineServices(jibo, requireFn) {
             const s = String(url == null ? '' : url);
             const routed = robotRoute(s);
             if (routed) url = routed;
+            else if (/^file:\/\//i.test(s)) {
+              const robot = robotPath(s);
+              url = robot ? robotFsUrl(robot) : new URL(s).pathname;
+            }
             else if (isCrossOrigin(s)) {
               url = `${location.origin}/__img?url=${encodeURIComponent(s)}`;
             }

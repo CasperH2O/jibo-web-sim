@@ -16,6 +16,8 @@
 // ((module, exports, require, __dirname, __filename)), so resolution is sync
 // like the real thing.
 
+import { robotPath, robotFsUrl, robotFs } from './robot-fs.js';
+
 // Native XHR captured up-front so our internal sync requests (module loading, fs)
 // keep working even after the service layer swaps window.XMLHttpRequest to route
 // HTTP-service calls (see services/service-bus.js installHttpInterceptor).
@@ -190,16 +192,37 @@ export function createRequire(jibo) {
     return r;
   };
   builtins.module.Module = builtins.module;
+  // NODE_PATH is not consulted, so re-reading it is a no-op (BEam's skills-resolve calls it).
+  builtins.module._initPaths = function () {};
+  const ownResolveFilename = builtins.module._resolveFilename;
+  // A bundle may hook Module._resolveFilename: BEam's skills-resolve maps @be/<name> to the
+  // packs under its skills root instead of node_modules. Route requires through the hook then.
+  function resolveRequest(request, fromDir) {
+    if (builtins.module._resolveFilename === ownResolveFilename) return resolve(request, fromDir);
+    const filename = join(fromDir, 'index.js');
+    try {
+      return builtins.module._resolveFilename(request, { id: filename, filename, paths: builtins.module._nodeModulePaths(fromDir) }, false);
+    } catch (_) { return null; }
+  }
 
   function requireFrom(fromDir) {
-    return function require(request) {
+    // Node's require.cache and require.resolve: BEam's skill registry purges cache entries
+    // to reload a skill.
+    require.cache = moduleCache;
+    require.resolve = (request) => {
+      const url = resolveRequest(request, fromDir);
+      if (!url) { const e = new Error(`Cannot find module '${request}'`); e.code = 'MODULE_NOT_FOUND'; throw e; }
+      return url;
+    };
+    return require;
+    function require(request) {
       // With a shim supplied, require('jibo') returns it. With none (createRequire(null)),
       // it falls through to node_modules so the bundle's OWN real jibo runtime loads.
       if (request === 'jibo' && jibo) return jibo;
       if (request in overrides) return overrides[request];
       if (builtins[request]) return builtins[request];
 
-      const url = resolve(request, fromDir);
+      const url = resolveRequest(request, fromDir);
       if (!url) { if (window.__CJS_DEBUG__) console.warn(`[require] cannot resolve '${request}' from ${fromDir}`); return {}; }
       if (moduleCache[url]) return moduleCache[url].exports;
 
@@ -221,7 +244,7 @@ export function createRequire(jibo) {
         console.error(`[require] error executing ${url}:`, detail);
       }
       return module.exports;
-    };
+    }
   }
 
   return requireFrom;
@@ -240,6 +263,79 @@ function tolerantStub() {
     },
     apply() { return tolerantStub(); },
     construct() { return tolerantStub(); },
+  });
+}
+
+// Robot paths (/opt/jibo, /var/jibo, /opt/tmp, /tmp) go to the dev server's robot file
+// system when it has one (robot-fs.js); every other path keeps the HTTP fs below. Also adds
+// the parts of Node's fs that bundles use beyond reading (BEam's runtime-state creates its
+// directories with mkdir, stat, chmod and access, and its settings files with link).
+function withRobotFs(base) {
+  const encodingOf = (o) => (typeof o === 'string' ? o : o && o.encoding) || null;
+  const toBody = (data, enc) => {
+    if (typeof data === 'string' && enc === 'base64') return Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+    if (typeof data === 'string' || data instanceof ArrayBuffer || ArrayBuffer.isView(data)) return data;
+    return String(data);
+  };
+  const decode = (bytes, enc) => {
+    if (!enc) return typeof window !== 'undefined' && window.Buffer ? window.Buffer.from(bytes) : bytes;
+    if (enc === 'base64') { let bin = ''; for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]); return btoa(bin); }
+    return new TextDecoder().decode(bytes);
+  };
+  const enoent = (p, call) => Object.assign(new Error(`ENOENT: no such file or directory, ${call} '${p}'`), { code: 'ENOENT', path: p });
+  // later(cb, fn): runs a sync call and reports it through a Node-style callback.
+  const later = (cb, fn) => {
+    let result; let error = null;
+    try { result = fn(); } catch (e) { error = e; }
+    if (typeof cb === 'function') setTimeout(() => cb(error, result), 0);
+  };
+  const cbOf = (...args) => args.find((a) => typeof a === 'function');
+  const optsOf = (o) => (typeof o === 'function' ? undefined : o);
+
+  const existsSync = (p) => { const r = robotPath(p); return r ? robotFs.exists(r) : base.existsSync(p); };
+  const statSync = (p) => { const r = robotPath(p); return r ? robotFs.stat(r) : base.statSync(p); };
+  const readFileSync = (p, o) => { const r = robotPath(p); return r ? decode(robotFs.read(r), encodingOf(o)) : base.readFileSync(p, o); };
+  const writeFileSync = (p, d, o) => { const r = robotPath(p); if (r) robotFs.write(r, toBody(d, encodingOf(o)), (o && o.flag) || 'w'); };
+  const appendFileSync = (p, d, o) => { const r = robotPath(p); if (r) robotFs.write(r, toBody(d, encodingOf(o)), 'a'); };
+  const mkdirSync = (p, o) => { const r = robotPath(p); if (r) robotFs.op('mkdir', r, { recursive: o && o.recursive ? 1 : undefined }); };
+  const readdirSync = (p, o) => {
+    const r = robotPath(p);
+    if (!r) return base.readdirSync(p, o);
+    const names = robotFs.readdir(r);
+    if (!(o && o.withFileTypes)) return names;
+    return names.map((name) => { const st = robotFs.stat(`${r}/${name}`); return { name, isFile: st.isFile, isDirectory: st.isDirectory, isSymbolicLink: () => false }; });
+  };
+  const accessSync = (p) => { if (!existsSync(p)) throw enoent(p, 'access'); };
+  const realpathSync = (p) => { if (robotPath(p) && !existsSync(p)) throw enoent(p, 'realpath'); return robotPath(p) || String(p); };
+  // Calls on one robot path, or a pair (a -> b); elsewhere they do nothing, as before.
+  const one = (op, extra) => (p, o) => { const r = robotPath(p); if (r) robotFs.op(op, r, extra ? extra(o) : undefined); };
+  const two = (op) => (a, b) => { const ra = robotPath(a); const rb = robotPath(b); if (ra && rb) robotFs.op(op, ra, { to: rb }); };
+  const unlinkSync = one('unlink');
+  const rmdirSync = one('rmdir');
+  const rmSync = one('rm', (o) => ({ recursive: o && o.recursive ? 1 : undefined, force: o && o.force ? 1 : undefined }));
+  const chmodSync = one('chmod', (mode) => ({ mode: Number(mode || 0).toString(8) }));
+  const renameSync = two('rename');
+  const copyFileSync = two('copy');
+  const linkSync = two('link');
+
+  return Object.assign({}, base, {
+    constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 },
+    existsSync, statSync, lstatSync: statSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync,
+    accessSync, realpathSync, unlinkSync, rmdirSync, rmSync, chmodSync, renameSync, copyFileSync, linkSync,
+    exists: (p, cb) => later((e, r) => cb && cb(r), () => existsSync(p)),
+    stat: (p, cb) => (robotPath(p) ? later(cb, () => statSync(p)) : base.stat(p, cb)),
+    lstat: (p, cb) => (robotPath(p) ? later(cb, () => statSync(p)) : base.stat(p, cb)),
+    readFile: (p, o, cb) => (robotPath(p) ? later(cbOf(o, cb), () => readFileSync(p, optsOf(o))) : base.readFile(p, o, cb)),
+    readdir: (p, o, cb) => (robotPath(p) ? later(cbOf(o, cb), () => readdirSync(p, optsOf(o))) : base.readdir(p, cbOf(o, cb))),
+    writeFile: (p, d, o, cb) => later(cbOf(o, cb), () => writeFileSync(p, d, optsOf(o))),
+    appendFile: (p, d, o, cb) => later(cbOf(o, cb), () => appendFileSync(p, d, optsOf(o))),
+    mkdir: (p, o, cb) => later(cbOf(o, cb), () => mkdirSync(p, optsOf(o))),
+    access: (p, m, cb) => later(cbOf(m, cb), () => accessSync(p)),
+    unlink: (p, cb) => later(cb, () => unlinkSync(p)),
+    rmdir: (p, cb) => later(cb, () => rmdirSync(p)),
+    rename: (a, b, cb) => later(cb, () => renameSync(a, b)),
+    copyFile: (a, b, cb) => later(cb, () => copyFileSync(a, b)),
+    chmod: (p, m, cb) => later(cb, () => chmodSync(p, m)),
   });
 }
 
@@ -263,7 +359,8 @@ function makeHttpFs() {
   // (e.g. jibojis/coin-flip/coin-tails.png). Earlier version only
   // matched a leaf filename so multi-segment paths fell through and
   // returned ENOENT.
-  const BE_TEX_RE = /^(.*?)\/@be\/[^/]+\/animations\/textures\/(.+?)(\?.*)?$/;
+  // 1.9.2 keeps its packs at node_modules/@be/<skill>, BEam at jibo-be/skills/<skill>.
+  const BE_TEX_RE = /^(.*?)\/(?:@be|jibo-be\/skills)\/[^/]+\/animations\/textures\/(.+?)(\?.*)?$/;
   function rewriteAnimTexture(p) {
     const m = BE_TEX_RE.exec(String(p));
     return m ? ANIM_DB_TEX + m[2] + (m[3] || '') : p;
@@ -271,6 +368,18 @@ function makeHttpFs() {
   function mapUrl(p) {
     p = String(p);
     if (/^(https?:)?\/\//.test(p)) return p;
+    const robot = robotPath(p);
+    if (robot) return robotFsUrl(robot);
+    // Collapse `.` and `..` segments (BEam builds paths like beacon/lib/../../skills/x).
+    if (/(^|\/)\.\.?(\/|$)/.test(p)) {
+      const out = [];
+      for (const part of p.split('/')) {
+        if (part === '.') continue;
+        if (part !== '..') out.push(part);
+        else if (out.length && out[out.length - 1] !== '') out.pop();
+      }
+      p = out.join('/') || '/';
+    }
     const root = (typeof window !== 'undefined' && window.__SKILL_DIR__) || '';
     const i = p.lastIndexOf('/node_modules/');
     if (i >= 0) return rewriteAnimTexture(root + p.slice(i));
@@ -1250,7 +1359,7 @@ function makeBuiltins() {
     // HTTP-backed fs: the real jibo loader (LocalLoader) reads assets via
     // fs.readFile(uri, 'base64'|'utf8'). We map the absolute bundle path onto the
     // skill's HTTP root and fetch it, so the disk loader works unmodified.
-    fs: makeHttpFs(),
+    fs: withRobotFs(makeHttpFs()),
     os: { platform: () => 'browser', homedir: () => '/', tmpdir: () => '/tmp', EOL: '\n', hostname: () => 'websim' },
     // The real jibo runtime's GlobalPerfTimer double-stops a perf timer during
     // init (benign instrumentation) and asserts on it; that throw would break

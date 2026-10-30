@@ -76,10 +76,14 @@ const _nluReady = (async () => {
   for (const src of sources) {
     const escapedRoot = src.root.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&');
     const launchRe = new RegExp('^' + escapedRoot + '/node_modules/(@[^/]+/[^/]+|[^/]+)/launch\\.rule$');
+    // BEam keeps its @be packs in the host's skills root (jibo.skillsRoot, ./skills).
+    const packRe = new RegExp('^' + escapedRoot + '/skills/([^/]+)/launch\\.rule$');
     const grmRe = /\/([^/]+)\.grm$/;
     for (const url of src.manifest.keys()) {
       const lm = launchRe.exec(url);
       if (lm) { launches.push({ pkg: lm[1], url }); continue; }
+      const pm = packRe.exec(url);
+      if (pm) { launches.push({ pkg: `@be/${pm[1]}`, url }); continue; }
       const gm = grmRe.exec(url);
       if (gm) grammars.push({ name: gm[1], url });
     }
@@ -213,6 +217,12 @@ function commonGlobals(req) {
 async function bootReal() {
   window.__SKILL_DIR__ = dir;          // HTTP root for the loader's fs + asset resolution
   window.__JIBO_ELECTRON__ = true;     // the runtime builds its render path under electron
+  // The robot's own file system (robot-fs.js), when the dev server has one: before the
+  // bundle's first require, which may already read or create robot paths.
+  try {
+    const config = await (await fetch('/robot/config', { cache: 'no-store' })).json();
+    window.__ROBOT_FS__ = config.robotFs === true;
+  } catch (_) { window.__ROBOT_FS__ = false; }
   const req = createRequire(null)(dir); // require('jibo') -> the bundle's real runtime
   commonGlobals(req);
   window.process = req('process');
